@@ -58,6 +58,13 @@ def build_prompt(ticket: Ticket, *, memory: MemoryRepo, index: SearchIndex, slug
 4. Do NOT deploy, push, or run vercel/supabase CLIs. Startup OS builds, tests, deploys and migrates
    after you finish. Leave changes uncommitted; Startup OS commits them.
 5. Database changes go in `supabase/migrations/<timestamp>_<name>.sql` (plain SQL, idempotent where possible).
+   Migrations MUST be backward-compatible (additive only), because the previous version of the app
+   keeps running against the same database during and after the deploy:
+   - no DROP (tables, columns, indexes, constraints, ...) and no TRUNCATE;
+   - no RENAME (add a new column/table and backfill instead);
+   - no NOT NULL without a DEFAULT on an existing table (no `ADD COLUMN ... NOT NULL` without
+     `DEFAULT`, no `SET NOT NULL`), and no column TYPE changes.
+   New tables may use NOT NULL freely. Startup OS rejects non-additive migrations before they run.
 6. Never hardcode secrets or URLs of external services. Read configuration from environment variables
    (e.g. {env_names}); document any you need in README.md. You do not have, and must not ask for, credentials.
 7. Money: do not add anything that needs a paid plan, a custom domain or a paid API. If the ticket truly

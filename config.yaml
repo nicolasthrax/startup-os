@@ -75,7 +75,7 @@ ship:
   step_timeout_min: 15
   vercel_cli: vercel@64.7.0
   supabase_cli: supabase@2.121.0
-  health_minutes: 10        # watch prod /api/health after promotion; roll back on failure
+  health_minutes: 10        # watch prod /api/health after promotion
   health_interval_s: 30
-  health_failures_before_rollback: 1
+  health_failures_before_rollback: 3   # consecutive failed checks before an automatic rollback
   max_smoke_checks: 3

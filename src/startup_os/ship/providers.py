@@ -2,7 +2,11 @@
 only as env vars to these subprocesses. Paid-plan errors raise PaidPlanRequired."""
 from __future__ import annotations
 
+import json
 import re
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -67,6 +71,26 @@ class Vercel:
 
     def rollback(self) -> CmdResult:
         return self._run("rollback", "--yes")
+
+    def sync_env(self, target: str, values: dict[str, str]) -> None:
+        """Upsert project env vars for one target ("preview" or "production") via the Vercel API."""
+        s = self.secrets
+        q = {"upsert": "true"}
+        if s.get("VERCEL_ORG_ID").startswith("team_"):
+            q["teamId"] = s.get("VERCEL_ORG_ID")
+        url = f"https://api.vercel.com/v10/projects/{s.get('VERCEL_PROJECT_ID')}/env?{urllib.parse.urlencode(q)}"
+        for key, value in values.items():
+            body = json.dumps({"key": key, "value": value, "type": "encrypted", "target": [target]}).encode()
+            req = urllib.request.Request(url, data=body, method="POST", headers={
+                "Authorization": f"Bearer {s.get('VERCEL_TOKEN')}", "Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(req, timeout=30):
+                    pass
+            except urllib.error.HTTPError as e:
+                detail = e.read(500).decode("utf-8", "replace")
+                if e.code == 402 or PAID_PATTERNS.search(detail):
+                    raise PaidPlanRequired("Vercel Pro plan", detail, 20) from e
+                raise StepFailed(f"setting {key} for {target} failed: HTTP {e.code} {detail[:200]}") from e
 
 
 @dataclass

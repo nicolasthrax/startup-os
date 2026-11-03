@@ -113,7 +113,7 @@ class ShipConfig(BaseModel):
     supabase_cli: str = "supabase@2.121.0"
     health_minutes: float = 10           # prod health watch after promotion
     health_interval_s: float = 30
-    health_failures_before_rollback: int = 1
+    health_failures_before_rollback: int = 3   # consecutive failed checks before rollback
     max_smoke_checks: int = 3
 
 

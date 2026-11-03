@@ -19,9 +19,13 @@ SECRETS = {"VENTURE_HELLO_VERCEL_TOKEN": "vercel-secret-token-123", "VENTURE_HEL
            "VENTURE_HELLO_VERCEL_PROJECT_ID": "prj_hello", "VENTURE_HELLO_PROD_URL": "https://hello.vercel.app",
            "VENTURE_HELLO_SUPABASE_STAGING_DB_URL": "postgresql://staging:pw-staging@db/x",
            "VENTURE_HELLO_SUPABASE_PROD_DB_URL": "postgresql://prod:pw-prod@db/x",
+           "VENTURE_HELLO_SUPABASE_STAGING_API_URL": "https://staging.supabase.co",
+           "VENTURE_HELLO_SUPABASE_STAGING_ANON_KEY": "anon-staging-key",
+           "VENTURE_HELLO_SUPABASE_PROD_API_URL": "https://prod.supabase.co",
+           "VENTURE_HELLO_SUPABASE_PROD_ANON_KEY": "anon-prod-key",
            "OPENROUTER_API_KEY": "sk-or-v1-should-not-leak", "PATH": "/usr/bin"}
-ORDER = ["Claude Code", "a) build", "b) tests", "c) preview deploy", "d) smoke test", "e) staging migrations",
-         "e) prod migrations", "f) promote to prod", "g) prod health watch"]
+ORDER = ["Claude Code", "a) build", "b) tests", "c) staging migrations", "d) preview deploy", "e) smoke test",
+         "f) prod migrations", "g) promote to prod", "h) prod health watch"]
 
 
 class Calls(list):
@@ -30,9 +34,11 @@ class Calls(list):
 
 
 class FakeClaude:
-    def __init__(self, calls, ok=True, changes=True, timed_out=False, paid=None, migrations=False):
+    def __init__(self, calls, ok=True, changes=True, timed_out=False, paid=None, migrations=False,
+                 migration_sql="create table t(id int not null);"):
         self.calls, self.ok, self.changes, self.timed_out = calls, ok, changes, timed_out
         self.paid, self.migrations, self.prompts = paid, migrations, []
+        self.migration_sql = migration_sql
 
     def __call__(self, prompt, *, cwd, transcript, timeout_s):
         self.calls.append(("claude", timeout_s))
@@ -46,7 +52,7 @@ class FakeClaude:
                 (cwd / "ship.json").write_text(json.dumps({"paid_requirements": [self.paid]}))
             if self.migrations:
                 (cwd / "supabase" / "migrations").mkdir(parents=True, exist_ok=True)
-                (cwd / "supabase" / "migrations" / "001_init.sql").write_text("create table t(id int);")
+                (cwd / "supabase" / "migrations" / f"{len(self.prompts):03d}_m.sql").write_text(self.migration_sql)
         transcript.parent.mkdir(parents=True, exist_ok=True)
         transcript.write_text('{"type":"result","result":"done"}\n')
         return ClaudeResult(ok=self.ok and not self.timed_out, exit_code=0 if self.ok else 1,
@@ -90,6 +96,9 @@ class FakeVercel:
     def promote(self, url):
         self._maybe("promote")
         return "https://hello.vercel.app"
+
+    def sync_env(self, target, values):
+        self.calls.append((f"vercel env {target}", dict(values)))
 
     def rollback(self):
         self.calls.append(("vercel rollback", None))
@@ -158,9 +167,12 @@ def test_full_ship_runs_every_gate_in_order(cfg_path, clock):
     assert o.status == "shipped"
     assert steps(o) == [(s, "pass") for s in ORDER]
     names = [n for n in rt.calls.names() if n != "sleep"]
-    assert names[:5] == ["claude", "npm install", "npm build", "npm test", "vercel deploy"]
-    assert names[5:9] == ["smoke", "supabase staging", "supabase prod", "vercel promote"]
+    assert names[:11] == ["claude", "npm install", "npm build", "npm test", "supabase staging", "vercel env preview",
+                          "vercel deploy", "smoke", "supabase prod", "vercel env production", "vercel promote"]
     assert names.count("health") == 4                               # 2 min / 30 s
+    envs = {c[0]: c[1] for c in rt.calls if c[0].startswith("vercel env")}
+    assert envs["vercel env preview"]["NEXT_PUBLIC_SUPABASE_URL"] == "https://staging.supabase.co"   # preview → staging
+    assert envs["vercel env production"]["NEXT_PUBLIC_SUPABASE_URL"] == "https://prod.supabase.co"
     t = rt.tickets.get(tid)
     assert t.status == "done" and t.prod_url == "https://hello.vercel.app"
     assert (rt.cfg.ventures_dir / "hello" / ".git").exists()
@@ -169,11 +181,11 @@ def test_full_ship_runs_every_gate_in_order(cfg_path, clock):
 @pytest.mark.parametrize("fail_at,setup", [
     ("a) build", dict(shell_fail={"build"})),
     ("b) tests", dict(shell_fail={"test"})),
-    ("c) preview deploy", dict(vercel="deploy")),
-    ("d) smoke test", dict(smoke_ok=False)),
-    ("e) staging migrations", dict(supabase_fail="staging")),
-    ("e) prod migrations", dict(supabase_fail="prod")),
-    ("f) promote to prod", dict(vercel="promote")),
+    ("c) staging migrations", dict(supabase_fail="staging")),
+    ("d) preview deploy", dict(vercel="deploy")),
+    ("e) smoke test", dict(smoke_ok=False)),
+    ("f) prod migrations", dict(supabase_fail="prod")),
+    ("g) promote to prod", dict(vercel="promote")),
 ])
 def test_later_steps_never_run_after_a_failure(cfg_path, clock, fail_at, setup):
     if "vercel" in setup:
@@ -187,24 +199,24 @@ def test_later_steps_never_run_after_a_failure(cfg_path, clock, fail_at, setup):
     assert steps(o)[-1] == (fail_at, "fail")
     later = ORDER[ORDER.index(fail_at) + 1:]
     called = rt.calls.names()
-    if "e) staging migrations" in later:
-        assert "supabase staging" not in called
-    if "e) prod migrations" in later:
-        assert "supabase prod" not in called
-    if "f) promote to prod" in later:
-        assert "vercel promote" not in called
-    assert "health" not in called
+    gate_calls = {"b) tests": "npm test", "c) staging migrations": "supabase staging", "d) preview deploy": "vercel deploy",
+                  "e) smoke test": "smoke", "f) prod migrations": "supabase prod", "g) promote to prod": "vercel promote",
+                  "h) prod health watch": "health"}
+    for step in later:
+        assert gate_calls[step] not in called, f"{step} ran after {fail_at} failed"
 
 
-def test_dry_run_stops_after_preview_and_smoke(cfg_path, clock):
+def test_dry_run_lints_but_applies_no_migrations_and_stops_after_smoke(cfg_path, clock):
     rt = make_rt(cfg_path, clock, claude=FakeClaude(None, migrations=True))
     tid = hello_ticket(rt)
     [o] = rt.build(dry_run=True)
     assert o.status == "dry_run_ok" and o.preview_url == "https://hello-abc123.vercel.app"
-    assert steps(o)[:5] == [(s, "pass") for s in ORDER[:5]]
-    assert steps(o)[5:] == [(s, "skip") for s in ORDER[5:]]
+    assert steps(o) == [("Claude Code", "pass"), ("a) build", "pass"), ("b) tests", "pass"),
+                        ("c) staging migrations", "skip"), ("d) preview deploy", "pass"), ("e) smoke test", "pass"),
+                        ("f) prod migrations", "skip"), ("g) promote to prod", "skip"), ("h) prod health watch", "skip")]
+    assert "dry run: not applied; lint ok (1 new migration file(s)" in o.steps[3]["detail"]
     called = rt.calls.names()
-    assert not {"supabase staging", "supabase prod", "vercel promote", "health"} & set(called)
+    assert not {"supabase staging", "supabase prod", "vercel promote", "vercel env production", "health"} & set(called)
     t = rt.tickets.get(tid)
     assert t.status == "todo" and t.preview_url == o.preview_url and t.built_commit
     # a real build later reuses the dry-run commit: no second Claude Code session
@@ -270,7 +282,7 @@ def test_paid_plan_error_files_spend_request_and_stops(cfg_path, clock):
     tid = hello_ticket(rt)
     [o] = rt.build()
     assert o.status == "blocked_spend" and "spend request A-1" in o.reason
-    assert steps(o)[-1] == ("c) preview deploy", "fail")
+    assert steps(o)[-1] == ("d) preview deploy", "fail")
     assert "smoke" not in rt.calls.names()
     a = rt.approvals.get(1)
     assert a["kind"] == "spend_request" and a["requested_by"] == "build" and a["payload"]["blocks"] == [tid]
@@ -296,22 +308,49 @@ def test_paid_requirement_declared_by_code_stops_before_build(cfg_path, clock):
 
 
 # ------------------------------------------------------------------ rollback
-def test_failed_prod_health_rolls_back_and_writes_incident(cfg_path, clock):
-    rt = make_rt(cfg_path, clock, health_seq=[(True, "ok"), (False, "HTTP 500")])
+def test_three_consecutive_failed_health_checks_roll_back_and_write_incident(cfg_path, clock):
+    rt = make_rt(cfg_path, clock, health_seq=[(True, "ok"), (False, "HTTP 500"), (False, "HTTP 500"),
+                                              (False, "HTTP 502")])
     tid = hello_ticket(rt)
     [o] = rt.build()
-    assert o.status == "failed" and steps(o)[-1] == ("g) prod health watch", "fail")
+    assert o.status == "failed" and steps(o)[-1] == ("h) prod health watch", "fail")
+    assert "failed 3x in a row" in o.reason
     names = rt.calls.names()
     assert names.index("vercel rollback") > names.index("vercel promote")
-    assert names.count("health") == 2                                 # stopped at the first failure
+    assert names.count("health") == 4                                 # stopped at the 3rd consecutive failure
     retros = list((rt.memory.root / "retros").glob("*incident*.md"))
     assert len(retros) == 1
     meta, body = frontmatter.parse(retros[0].read_text())
     assert meta["type"] == "incident" and meta["ticket"] == tid and meta["rolled_back"] is True
-    assert "HTTP 500" in body and "## Timeline" in body
+    assert "HTTP 502" in body and "## Timeline" in body and body.count("| FAIL |") == 3
     t = rt.tickets.get(tid)
     assert t.status == "todo" and t.attempts == 1 and "rollback succeeded" in t.last_error
     assert rt.memory.log(5)[1].startswith("build: incident:") or any("incident" in m for m in rt.memory.log(5))
+
+
+@pytest.mark.parametrize("seq", [
+    [(False, "HTTP 500"), (False, "timeout"), (True, "ok"), (True, "ok")],      # 2 in a row: tolerated
+    [(False, "x"), (True, "ok"), (False, "x"), (False, "x")],                   # never 3 consecutive
+])
+def test_fewer_than_three_consecutive_failures_do_not_roll_back(cfg_path, clock, seq):
+    rt = make_rt(cfg_path, clock, health_seq=seq)
+    hello_ticket(rt)
+    [o] = rt.build()
+    assert o.status == "shipped" and "vercel rollback" not in rt.calls.names()
+    assert not list((rt.memory.root / "retros").glob("*incident*.md"))
+
+
+def test_rollback_threshold_is_configurable(cfg_path, clock):
+    import yaml
+    rt = make_rt(cfg_path, clock, health_seq=[(False, "x")])
+    assert rt.cfg.ship.health_failures_before_rollback == 3            # default
+    cfg = yaml.safe_load(cfg_path.read_text())
+    cfg["ship"]["health_failures_before_rollback"] = 1
+    cfg_path.write_text(yaml.safe_dump(cfg))
+    rt2 = Runtime(load_config(cfg_path), now=clock.now, ship_overrides=rt.fakes)
+    hello_ticket(rt2)
+    [o] = rt2.build()
+    assert o.status == "failed" and "vercel rollback" in rt.calls.names()
 
 
 def test_healthy_prod_watch_passes(cfg_path, clock):
@@ -393,7 +432,7 @@ def test_missing_credentials_block_without_strike(cfg_path, clock):
     tid = hello_ticket(rt)
     [o] = rt.build(dry_run=True)
     assert o.status == "blocked_config" and "VENTURE_HELLO_VERCEL_TOKEN" in o.reason
-    assert steps(o)[-1] == ("c) preview deploy", "fail")
+    assert steps(o)[-1] == ("d) preview deploy", "fail")
     assert rt.tickets.get(tid).attempts == 0
 
 
@@ -420,3 +459,77 @@ def test_derive_smoke_checks_from_acceptance_criteria():
     assert [(c.path, c.expect_text) for c in checks] == [("/", "Hello, world"), ("/about", "About us")]
     t2 = t.model_copy(update={"acceptance_criteria": ["It looks nice"]})
     assert [(c.path, c.expect_text) for c in derive_checks(t2)] == [("/", None)]
+
+
+# ------------------------------------------------------------------ migration lint
+@pytest.mark.parametrize("sql,ok", [
+    ("create table t (id int not null, name text not null);", True),
+    ("alter table t add column c text;", True),
+    ("alter table t add column c int not null default 0;", True),
+    ("alter table t alter column c drop not null;", True),
+    ("create index i on t(c);", True),
+    ("create function f() returns void as $$ begin drop table x; end $$ language plpgsql;", True),
+    ("-- drop table t\ninsert into t values ('rename me');", True),
+    ("drop table t;", False),
+    ("alter table t drop column c;", False),
+    ("drop index if exists i;", False),
+    ("alter table t rename column a to b;", False),
+    ("alter table t rename to u;", False),
+    ("alter table t add column c int not null;", False),
+    ("alter table t add column a int, add column b int not null;", False),
+    ("alter table t alter column c set not null;", False),
+    ("alter table t alter column c type bigint;", False),
+    ("truncate t;", False),
+])
+def test_migration_lint_rules(sql, ok):
+    from startup_os.ship.migration_lint import lint_sql
+    assert (lint_sql(sql) == []) == ok
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_non_additive_migration_fails_before_anything_is_applied(cfg_path, clock, dry_run):
+    rt = make_rt(cfg_path, clock, claude=FakeClaude(None, migrations=True,
+                                                     migration_sql="alter table users drop column email;"))
+    tid = hello_ticket(rt)
+    [o] = rt.build(dry_run=dry_run)
+    assert o.status == "failed" and steps(o)[-1] == ("c) staging migrations", "fail")
+    assert "not backward-compatible" in o.reason and "DROP" in o.reason and "001_m.sql" in o.reason
+    assert not {"supabase staging", "vercel deploy", "vercel env preview"} & set(rt.calls.names())
+    t = rt.tickets.get(tid)
+    assert t.attempts == 1 and t.built_commit is None                 # code must change: new session next time
+
+
+def test_lint_only_checks_migrations_added_since_last_ship(cfg_path, clock):
+    rt = make_rt(cfg_path, clock, claude=FakeClaude(None, migrations=True))
+    hello_ticket(rt)
+    [o1] = rt.build()
+    assert o1.status == "shipped"
+    hello_ticket(rt, title="Second feature")
+    [o2] = rt.build()
+    c_step = next(s for s in o2.steps if s["step"] == "c) staging migrations")
+    assert "lint ok (1 new migration file(s)" in c_step["detail"]     # 002 only; 001 already shipped
+
+
+def test_supabase_ventures_need_staging_app_settings(cfg_path, clock):
+    env = {k: v for k, v in SECRETS.items() if "STAGING_ANON" not in k}
+    rt = make_rt(cfg_path, clock, claude=FakeClaude(None, migrations=True), environ=env)
+    tid = hello_ticket(rt)
+    [o] = rt.build(dry_run=True)
+    assert o.status == "blocked_config" and "SUPABASE_STAGING_ANON_KEY" in o.reason
+    assert "vercel deploy" not in rt.calls.names() and rt.tickets.get(tid).attempts == 0
+
+
+def test_ventures_without_migrations_skip_supabase_wiring(cfg_path, clock):
+    rt = make_rt(cfg_path, clock)
+    hello_ticket(rt)
+    [o] = rt.build()
+    assert o.status == "shipped"
+    assert not any(n.startswith(("vercel env", "supabase")) for n in rt.calls.names())
+
+
+def test_prompt_states_additive_migration_rule(cfg_path, clock):
+    rt = make_rt(cfg_path, clock)
+    hello_ticket(rt)
+    rt.build(dry_run=True)
+    p = rt.fakes["claude"].prompts[0]
+    assert "backward-compatible (additive only)" in p and "no RENAME" in p and "no DROP" in p

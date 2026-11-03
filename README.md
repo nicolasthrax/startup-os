@@ -109,14 +109,24 @@ Then **our code** runs the ship bar, in order, stopping at the first failure:
 |---|---|
 | a) build | `npm install` + `npm run build` |
 | b) tests | `npm test` (a real test script is required) |
-| c) preview deploy | `vercel deploy` (pinned CLI) → preview URL |
-| d) smoke test | `GET /api/health` → `{"status":"ok"}`, plus 1–3 Playwright checks derived from acceptance criteria like `The home page / shows "Hello"` |
-| e) migrations | `supabase/migrations/*.sql` → the free **staging** project, then **prod** (no Supabase branching; it needs a paid plan) |
-| f) promote | `vercel promote <preview>` |
-| g) prod health | `/api/health` every 30 s for 10 min; on failure `vercel rollback` and an incident note in `company/retros/` |
+| c) staging migrations | static backward-compatibility lint of new `supabase/migrations/*.sql`, then apply them to the free **staging** Supabase project |
+| d) preview deploy | point the Vercel *preview* env at staging Supabase, then `vercel deploy` (pinned CLI) → preview URL |
+| e) smoke test | `GET /api/health` → `{"status":"ok"}`, plus 1–3 Playwright checks derived from acceptance criteria like `The home page / shows "Hello"` |
+| f) prod migrations | apply the same migrations to the **prod** Supabase project (only after the smoke test passed) |
+| g) promote | point the Vercel *production* env at prod Supabase, then `vercel promote <preview>` |
+| h) prod health | `/api/health` every 30 s for 10 min; after 3 consecutive failures (`health_failures_before_rollback`) `vercel rollback` and an incident note in `company/retros/` |
 
-`--dry-run` stops after d): no migrations and no prod. A ticket that passed a dry run keeps its
-commit, so the real build reuses it without a new Claude Code session.
+No Supabase branching (it needs a paid plan): staging and prod are two separate free projects.
+
+**Migrations must be backward-compatible (additive only)**, because the previous deployment keeps
+running against the same database: no DROP (except `DROP NOT NULL`), no RENAME, no TRUNCATE, no
+column TYPE change, and no NOT NULL without a DEFAULT on an existing table. Step c) checks every
+migration file added since the last successful ship *before* anything is applied, and fails with
+the offending file and statement. The same rule is in Claude Code's prompt.
+
+`--dry-run` runs a), b), the migration lint (nothing applied), d) and e), then stops: no staging or
+prod migrations and nothing in prod. A ticket that passed a dry run keeps its commit, so the real
+build reuses it without a new Claude Code session.
 
 **Limits.** `claude_code.sessions_per_day` (default 3) is counted in SQLite (`claude_sessions`),
 separate from the OpenRouter budget. Each session has `ticket_timeout_min`; each step has

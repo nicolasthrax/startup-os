@@ -1,9 +1,10 @@
 """`startup-os build`: run claude-code tickets through headless Claude Code and the ship bar.
 
 Ship bar (run by Startup OS, in order, stopping at the first failure):
-  a) build  b) tests  c) preview deploy  d) smoke test
-  e1) staging migrations  e2) prod migrations  f) promote  g) prod health (rollback on failure)
---dry-run stops after d): no migrations and no prod."""
+  a) build  b) tests  c) staging migrations (backward-compat lint first)  d) preview deploy
+  (wired to the staging Supabase project)  e) smoke test  f) prod migrations  g) promote
+  h) prod health (rollback after N consecutive failures)
+--dry-run runs the lint but applies no migrations, and stops after the smoke test: no prod."""
 from __future__ import annotations
 
 import time
@@ -21,6 +22,7 @@ from ..search_index import SearchIndex
 from ..spend import SpendGate
 from ..tickets import Ticket, TicketStore
 from .claude import ClaudeResult, ClaudeRunner
+from .migration_lint import lint_files
 from .prompt import build_prompt
 from .providers import PaidPlanRequired, StepFailed, Supabase, Vercel
 from .secrets import MissingCredential, VentureSecrets, clean_env, secret_values_in_env
@@ -30,11 +32,13 @@ from .store import ShipStore
 from .ventures import VentureRepo
 
 AGENT = "build"
-STEPS = [("build", "a) build"), ("test", "b) tests"), ("preview", "c) preview deploy"), ("smoke", "d) smoke test"),
-         ("migrate_staging", "e) staging migrations"), ("migrate_prod", "e) prod migrations"),
-         ("promote", "f) promote to prod"), ("prod_health", "g) prod health watch")]
-DRY_RUN_STEPS = {"build", "test", "preview", "smoke"}
-CODE_STEPS = {"claude_code", "build", "test", "smoke", "prod_health"}   # failures here need new code
+STEPS = [("build", "a) build"), ("test", "b) tests"), ("migrate_staging", "c) staging migrations"),
+         ("preview", "d) preview deploy"), ("smoke", "e) smoke test"), ("migrate_prod", "f) prod migrations"),
+         ("promote", "g) promote to prod"), ("prod_health", "h) prod health watch")]
+DRY_RUN_STEPS = {"build", "test", "preview", "smoke"}   # + the migration lint (not applied)
+# failures at these steps mean the code itself is suspect: the next attempt starts a new session
+CODE_STEPS = {"Claude Code", "a) build", "b) tests", "c) staging migrations", "e) smoke test", "h) prod health watch"}
+SHIPPED_TAG = "startup-os/shipped"
 
 
 class NotRunnable(ValueError):
@@ -159,6 +163,15 @@ class Builder:
                                        float(req.get("amount_usd") or 1))
             # a–g
             for name, label in STEPS:
+                if dry_run and name == "migrate_staging":
+                    t0 = time.monotonic()
+                    try:
+                        detail = self._lint(repo)
+                    except StepFailed as e:
+                        record(name, label, "fail", time.monotonic() - t0, str(e))
+                        raise ShipFailure(label, str(e)) from e
+                    record(name, label, "skip", time.monotonic() - t0, f"dry run: not applied; {detail}")
+                    continue
                 if dry_run and name not in DRY_RUN_STEPS:
                     record(name, label, "skip", 0, "dry run")
                     continue
@@ -194,6 +207,7 @@ class Builder:
                                      "last_error": None, "result": f"Shipped to {state['prod_url']} "
                                      f"(commit {repo.head()[:10]}, preview {state['preview_url']})"})
             msg = f"{t.id} shipped to {state['prod_url']}"
+            repo.git("tag", "-f", SHIPPED_TAG)   # later lints only check migrations added after this
         d.tickets.save(t, agent=AGENT, message=msg)
         return self._finish(t, o, log, None, state)
 
@@ -256,10 +270,23 @@ class Builder:
             raise StepFailed("no test suite: package.json has no real `test` script")
         return self._npm(repo, self.d.cfg.ship.test_cmd, "tests"), None
 
+    def _supabase_env(self, repo, secrets, which: str) -> dict[str, str]:
+        """Public Supabase settings for the app, for the `staging` or `prod` project."""
+        if not repo.migrations():
+            return {}
+        pre = f"SUPABASE_{which.upper()}"
+        return {"NEXT_PUBLIC_SUPABASE_URL": secrets.get(f"{pre}_API_URL"),
+                "NEXT_PUBLIC_SUPABASE_ANON_KEY": secrets.get(f"{pre}_ANON_KEY")}
+
     def _step_preview(self, t, repo, secrets, state, log):
-        url = self.d.vercel(secrets, repo.path).deploy_preview()
+        vercel = self.d.vercel(secrets, repo.path)
+        env = self._supabase_env(repo, secrets, "staging")
+        if env:   # previews talk to the staging Supabase project, never prod
+            vercel.sync_env("preview", env)
+            log.event("vercel_env", target="preview", supabase="staging", keys=sorted(env))
+        url = vercel.deploy_preview()
         state["preview_url"] = url
-        return "preview deployed", url
+        return "preview deployed" + (" (Supabase: staging)" if env else ""), url
 
     def _checks(self, t) -> list[Check]:
         return derive_checks(t, self.d.cfg.ship.max_smoke_checks)
@@ -272,6 +299,25 @@ class Builder:
             raise StepFailed(f"smoke test failed: {res.summary()}")
         return res.summary(), state["preview_url"]
 
+    def _new_migrations(self, repo) -> list[Path]:
+        """Migration files added or changed since the last successful ship (all, if never shipped)."""
+        files = repo.migrations()
+        try:
+            changed = set(repo.git("diff", "--name-only", SHIPPED_TAG, "HEAD", "--", "supabase/migrations").split())
+        except RuntimeError:   # no shipped tag yet
+            return files
+        return [f for f in files if str(f.relative_to(repo.path)) in changed]
+
+    def _lint(self, repo) -> str:
+        new = self._new_migrations(repo)
+        if not new:
+            return "no new migrations"
+        violations = lint_files(new, repo.path)
+        if violations:
+            raise StepFailed("migration is not backward-compatible (additive only: no DROP, no RENAME, "
+                             "no NOT NULL without DEFAULT on existing tables): " + "; ".join(map(str, violations)))
+        return f"lint ok ({len(new)} new migration file(s), additive only)"
+
     def _migrate(self, repo, secrets, which: str):
         if not repo.migrations():
             return "no migrations", None
@@ -279,13 +325,20 @@ class Builder:
         return f"{len(repo.migrations())} migration file(s) applied to {which}: {out[-150:]}", None
 
     def _step_migrate_staging(self, t, repo, secrets, state, log):
-        return self._migrate(repo, secrets, "staging")
+        lint = self._lint(repo)   # static check first; a violation fails the step before anything runs
+        detail, url = self._migrate(repo, secrets, "staging")
+        return f"{lint}; {detail}", url
 
     def _step_migrate_prod(self, t, repo, secrets, state, log):
         return self._migrate(repo, secrets, "prod")
 
     def _step_promote(self, t, repo, secrets, state, log):
-        state["prod_url"] = self.d.vercel(secrets, repo.path).promote(state["preview_url"])
+        vercel = self.d.vercel(secrets, repo.path)
+        env = self._supabase_env(repo, secrets, "prod")
+        if env:   # production deployments use the prod Supabase project
+            vercel.sync_env("production", env)
+            log.event("vercel_env", target="production", supabase="prod", keys=sorted(env))
+        state["prod_url"] = vercel.promote(state["preview_url"])
         return f"promoted {state['preview_url']}", state["prod_url"]
 
     def _step_prod_health(self, t, repo, secrets, state, log):
@@ -302,7 +355,7 @@ class Builder:
                 rb = self.d.vercel(secrets, repo.path).rollback()
                 log.event("rollback", ok=rb.ok, output=rb.tail(500))
                 note = self._incident(t, repo, url, history, rb)
-                raise StepFailed(f"prod health failed ({detail}); Vercel rollback "
+                raise StepFailed(f"prod health failed {consecutive}x in a row ({detail}); Vercel rollback "
                                  f"{'succeeded' if rb.ok else 'FAILED'}; incident note {note}")
             if i < checks - 1:
                 self.d.sleep(c.health_interval_s)
@@ -323,7 +376,8 @@ class Builder:
                  "```", rb.tail(800) or "(no output)", "```", "",
                  "## Follow-up", "", f"- {t.id} counts as a failed attempt; after {self.d.cfg.ship.max_attempts} "
                  "failures it goes back to the CEO (needs_rescope).",
-                 "- Note: prod database migrations, if any, were applied before promotion and are NOT rolled back."]
+                 "- Prod database migrations, if any, were applied before promotion and are NOT rolled back; "
+                 "they are additive-only (linted), so the previous deployment keeps working."]
         self.d.memory.write(rel, frontmatter.dump(meta, "\n".join(body) + "\n"), agent=AGENT,
                             message=f"incident: {t.venture} prod health failed after {t.id}; rollback "
                                     f"{'ok' if rb.ok else 'FAILED'}")
@@ -336,7 +390,7 @@ class Builder:
         error = f"Attempt {attempts} failed at {e.step}: {e.reason}"[:1500]
         rescope = attempts >= d.cfg.ship.max_attempts
         upd = {"attempts": attempts, "last_error": error, "status": "needs_rescope" if rescope else "todo"}
-        if e.step in {"Claude Code", "a) build", "b) tests", "d) smoke test", "g) prod health watch"}:
+        if e.step in CODE_STEPS:
             upd["built_commit"] = None   # the code itself is suspect: next attempt starts a new session
         t = t.model_copy(update=upd)
         d.tickets.save(t, agent=AGENT, message=f"{t.id} attempt {attempts} failed at {e.step}"
