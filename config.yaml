@@ -1,0 +1,44 @@
+# Startup OS configuration. Paths are relative to this file.
+
+paths:
+  company: company        # memory repo (its own Git repo, created on first run)
+  data: data              # SQLite: usage/queue, search index, LangGraph checkpoints
+  logs: logs              # structured JSONL run logs
+
+llm:
+  base_url: https://openrouter.ai/api/v1
+  api_key_env: OPENROUTER_API_KEY
+  timeout_s: 90
+  temperature: 0.7
+  max_tokens: 2500
+  # Tried in order. On a 429 or any error the next model is tried; if all fail
+  # the task is deferred by `defer_hours_on_failure`. Only ":free" models, so
+  # nothing here spends money. Run `uv run startup-os models` to list the
+  # free models OpenRouter currently offers and update this list.
+  models:
+    - meta-llama/llama-3.3-70b-instruct:free
+    - deepseek/deepseek-chat-v3-0324:free
+    - qwen/qwen3-235b-a22b:free
+    - mistralai/mistral-small-3.2-24b-instruct:free
+    - google/gemma-3-27b-it:free
+  defer_hours_on_failure: 1
+
+budget:
+  daily_requests: 1000    # every LLM request attempt (including fallbacks) counts
+  per_minute: 20          # token-bucket rate limit
+  # Share of the daily quota per agent, in percent (must sum to <= 100).
+  agents:
+    research: 40
+    ceo: 25
+    product: 15
+    engineer: 15
+    reserve: 5
+
+guards:
+  max_steps_per_task: 8          # LLM steps per idea brief before forcing a final answer
+  max_identical_tool_calls: 2    # the 2nd identical call (same tool + args) stops the loop
+
+web_search:
+  enabled: true
+  provider: duckduckgo    # free, no API key
+  max_results: 5

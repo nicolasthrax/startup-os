@@ -1,0 +1,32 @@
+[project]
+name = "startup-os"
+version = "0.1.0"
+description = "A reusable multi-agent system that generates startup ideas, validates one, and ships an MVP."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "langgraph>=0.6",
+    "langgraph-checkpoint-sqlite>=2.0",
+    "openai>=1.40",
+    "pydantic>=2.7",
+    "pyyaml>=6.0",
+    "python-dotenv>=1.0",
+    "ddgs>=9.0",
+]
+
+[project.scripts]
+startup-os = "startup_os.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/startup_os"]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
