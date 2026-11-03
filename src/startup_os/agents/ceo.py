@@ -230,7 +230,9 @@ Reply with ONE JSON object: {{"action": "final", "plan": {PLAN_SCHEMA}}}"""
 # -------------------------------------------------------------- render ---
 def render_plan(*, week: str, draft: PlanDraft, venture_name: str | None, stage: str,
                 tickets: list[Ticket], spend: list[dict], approval: dict, shares_now: dict,
-                daily: int, notes: list[str], run_id: str, models: list[str], created: str) -> str:
+                daily: int, notes: list[str], run_id: str, models: list[str], created: str,
+                ticket_paths: dict[str, str] | None = None) -> str:
+    ticket_paths = ticket_paths or {}
     meta = {"week": week, "status": "pending_approval", "approval": approval["ref"],
             "auto_approve_at": approval["auto_approve_at"], "venture": venture_name, "stage": stage,
             "created": created, "agent": AGENT, "run_id": run_id, "models": sorted(set(models)),
