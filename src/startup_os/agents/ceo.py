@@ -241,8 +241,8 @@ def render_plan(*, week: str, draft: PlanDraft, venture_name: str | None, stage:
     L += ["", "## Tickets", ""]
     if tickets:
         L += ["| ID | Owner | Title | Status | Depends on |", "|---|---|---|---|---|"]
-        L += [f"| [{t.id}](../tickets/) | {t.owner} | {t.title} | {t.status} | {', '.join(t.depends_on) or '—'} |"
-              for t in tickets]
+        L += [f"| [{t.id}](../{ticket_paths.get(t.id, 'tickets/')}) | {t.owner} | {t.title} | {t.status} | "
+              f"{', '.join(t.depends_on) or '—'} |" for t in tickets]
         if any(t.owner == "claude-code" for t in tickets):
             L += ["", "_claude-code tickets are queued only; they are not executed in this slice._"]
     else:
@@ -396,7 +396,8 @@ def build_plan_graph(deps: CEODeps, checkpointer=None):
                               spend=[deps.approvals.get(s["id"]) for s in spend_rows], approval=approval,
                               shares_now=deps.scheduler.effective_shares(), daily=deps.scheduler.daily_requests,
                               notes=notes, run_id=state.get("run_id", log.run_id),
-                              models=state["models_used"], created=created)
+                              models=state["models_used"], created=created,
+                              ticket_paths={t.id: path for path, t in zip(deps.tickets.files_for(final), final)})
         sha = deps.memory.write_many({rel: content, **deps.tickets.files_for(final)}, agent=AGENT,
                                      message=f"plan {week}: {len(final)} tickets, {len(spend_rows)} spend requests "
                                              f"(awaiting {approval['ref']})")
