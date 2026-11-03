@@ -14,6 +14,8 @@
 - Never skip, disable or weaken a test to get green.
 - Nothing may spend money. Payment-capable code goes through `SpendGate` (`src/startup_os/spend.py`).
 - Idea picks are the human's. Agents may only recommend; `startup-os pick` needs an explicit file.
+- Ship pipeline: steps a–g are run by Startup OS, never by Claude Code. Never pass secrets into a
+  Claude Code prompt or its environment; credentials reach only our deploy/migrate subprocesses as env vars.
 - The OpenRouter call budget has exactly three agents: `ceo`, `research`, `reserve`. Claude Code uses
   a separate subscription and never takes OpenRouter quota.
 

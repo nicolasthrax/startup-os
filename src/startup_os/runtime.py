@@ -57,8 +57,9 @@ TASK_AGENT = {"ideas": "research", "validate": "research", "ticket": "research",
 
 class Runtime:
     def __init__(self, cfg: Config, *, call_fn: CallFn | None = None, web_search_fn=None,
-                 scheduler: Scheduler | None = None, now=None):
+                 scheduler: Scheduler | None = None, now=None, ship_overrides: dict | None = None):
         self.cfg = cfg
+        self.ship_overrides = ship_overrides or {}
         self.now = now or (lambda: datetime.now(timezone.utc))
         cfg.data_dir.mkdir(parents=True, exist_ok=True)
         self.index = SearchIndex(cfg.data_dir / "index.db", cfg.company_dir)
@@ -279,6 +280,33 @@ class Runtime:
             if out.status == "deferred":
                 break
         return results
+
+    # ------------------------------------------------------------- build --
+    def builder(self, **overrides):
+        from .ship.pipeline import Builder, ShipDeps
+        from .ship.store import ShipStore
+        deps = ShipDeps(cfg=self.cfg, memory=self.memory, index=self.index, tickets=self.tickets,
+                        approvals=self.approvals, spend_gate=self.spend_gate,
+                        store=ShipStore(self.cfg.data_dir / "state.db", self.now), now=self.now,
+                        **{**self.ship_overrides, **overrides})
+        return Builder(deps)
+
+    def build(self, ticket_id: str | None = None, dry_run: bool = False):
+        from .ship.pipeline import NotRunnable
+        from .tickets import TicketError
+        try:
+            return self.builder().build(ticket_id, dry_run=dry_run)
+        except (NotRunnable, TicketError) as e:
+            raise CommandError(str(e)) from e
+
+    def add_ticket(self, *, title: str, owner: str, venture: str | None, criteria: list[str],
+                   description: str = "", depends_on: list[str] | None = None) -> str:
+        """Human-created ticket (e.g. for a throwaway venture)."""
+        t = self.tickets.new(title=title, owner=owner, venture=venture, acceptance_criteria=criteria,
+                             description=description, depends_on=depends_on or [], created_by="human")
+        self.tickets.save(t, agent="human", message=f"create {t.id} ({owner}): {title}")
+        self.tickets.refresh(self.approvals.status)
+        return t.id
 
     def plan(self) -> TaskOutcome:
         self.call_fn()

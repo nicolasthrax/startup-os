@@ -17,8 +17,8 @@ from .memory import MemoryRepo
 
 TICKETS_DIR = "tickets"
 Owner = Literal["research", "claude-code"]
-Status = Literal["todo", "blocked", "in_progress", "done", "cancelled"]
-OPEN = ("todo", "blocked", "in_progress")
+Status = Literal["todo", "blocked", "in_progress", "done", "cancelled", "needs_rescope"]
+OPEN = ("todo", "blocked", "in_progress", "needs_rescope")
 _ID = re.compile(r"^T-\d{4,}$")
 _DEP = re.compile(r"^(T-\d{4,}|A-\d+)$")
 
@@ -42,6 +42,13 @@ class Ticket(BaseModel):
     inputs: list[str] = Field(default_factory=list)   # company/ files to read (validated)
     blocked_reason: str | None = None
     result: str | None = None
+    # claude-code execution state
+    attempts: int = 0
+    last_error: str | None = None
+    built_commit: str | None = None       # venture commit whose ship bar has not failed yet
+    preview_url: str | None = None
+    prod_url: str | None = None
+    smoke_checks: list[dict] = Field(default_factory=list)   # optional [{path, expect_text}]
     description: str = ""          # Markdown body, not front matter
 
     @field_validator("id")
@@ -77,6 +84,8 @@ class Ticket(BaseModel):
         if self.inputs:
             body += ["## Inputs", ""] + [f"- [{p}](../{p})" for p in self.inputs] + [""]
         body += ["## Acceptance criteria", ""] + [f"- [ ] {c}" for c in self.acceptance_criteria]
+        if self.status == "needs_rescope" and self.last_error:
+            body += ["", "## Failure summary (needs rescope)", "", self.last_error]
         if self.result:
             body += ["", "## Result", "", self.result]
         return frontmatter.dump(meta, "\n".join(body) + "\n")
@@ -86,7 +95,7 @@ class Ticket(BaseModel):
         meta, body = frontmatter.parse(text)
         if not meta:
             raise TicketError("ticket has no front matter")
-        m = re.search(r"\A#[^\n]*\n+(.*?)(?:\n## (?:Inputs|Acceptance criteria)|\Z)", body, re.DOTALL)
+        m = re.search(r"\A#[^\n]*\n+(.*?)(?:\n## (?:Inputs|Acceptance criteria|Failure summary|Result)|\Z)", body, re.DOTALL)
         desc = m.group(1).strip() if m else ""
         return cls(**meta, description="" if desc == "_No description._" else desc)
 

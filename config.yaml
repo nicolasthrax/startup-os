@@ -58,3 +58,24 @@ research_tickets:         # `startup-os research`: any open research ticket (non
 
 ceo:
   max_steps: 3            # plan draft attempts (first try + repairs)
+
+# ---- Claude Code executor (`startup-os build`) --------------------------------
+# Claude Code runs on its own subscription; these limits are separate from the
+# OpenRouter budget above.
+claude_code:
+  command: claude
+  sessions_per_day: 3       # headless sessions per UTC day, tracked in data/state.db
+  ticket_timeout_min: 30    # one Claude Code session per ticket attempt
+  max_turns: 60
+  permission_mode: acceptEdits
+
+ship:
+  ventures_dir: ventures    # each venture is its own Git repo (git-ignored here)
+  max_attempts: 2           # two failed attempts → ticket status needs_rescope (back to the CEO)
+  step_timeout_min: 15
+  vercel_cli: vercel@64.7.0
+  supabase_cli: supabase@2.121.0
+  health_minutes: 10        # watch prod /api/health after promotion; roll back on failure
+  health_interval_s: 30
+  health_failures_before_rollback: 1
+  max_smoke_checks: 3

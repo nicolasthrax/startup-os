@@ -88,6 +88,35 @@ class ResearchTicketsConfig(BaseModel):
     max_tool_calls: int = 6      # tool calls per research ticket
 
 
+class ClaudeCodeConfig(BaseModel):
+    command: str = "claude"
+    sessions_per_day: int = 3            # tracked in SQLite; separate from the OpenRouter budget
+    ticket_timeout_min: float = 30       # wall-clock limit for one Claude Code session
+    max_turns: int = 60
+    permission_mode: str = "acceptEdits"
+    allowed_tools: list[str] = Field(default_factory=lambda: [
+        "Read", "Write", "Edit", "Glob", "Grep", "Bash(npm:*)", "Bash(npx:*)", "Bash(node:*)",
+        "Bash(git status:*)", "Bash(git diff:*)", "Bash(ls:*)", "Bash(mkdir:*)", "Bash(cat:*)"])
+    disallowed_tools: list[str] = Field(default_factory=lambda: [
+        "Bash(vercel:*)", "Bash(npx vercel:*)", "Bash(supabase:*)", "Bash(npx supabase:*)",
+        "Bash(git push:*)", "Bash(curl:*)", "WebFetch"])
+
+
+class ShipConfig(BaseModel):
+    ventures_dir: Path = Path("ventures")
+    max_attempts: int = 2                # failures before a ticket goes back to the CEO
+    install_cmd: list[str] = Field(default_factory=lambda: ["npm", "install", "--no-audit", "--no-fund"])
+    build_cmd: list[str] = Field(default_factory=lambda: ["npm", "run", "build"])
+    test_cmd: list[str] = Field(default_factory=lambda: ["npm", "test"])
+    step_timeout_min: float = 15
+    vercel_cli: str = "vercel@64.7.0"     # pinned, >= 2 weeks old
+    supabase_cli: str = "supabase@2.121.0"
+    health_minutes: float = 10           # prod health watch after promotion
+    health_interval_s: float = 30
+    health_failures_before_rollback: int = 1
+    max_smoke_checks: int = 3
+
+
 class CEOConfig(BaseModel):
     max_steps: int = 3          # draft attempts (initial + repairs) per plan
 
@@ -102,6 +131,12 @@ class Config(BaseModel):
     validation: ValidationConfig = ValidationConfig()
     ceo: CEOConfig = CEOConfig()
     research_tickets: ResearchTicketsConfig = ResearchTicketsConfig()
+    claude_code: ClaudeCodeConfig = ClaudeCodeConfig()
+    ship: ShipConfig = ShipConfig()
+
+    @property
+    def ventures_dir(self) -> Path:
+        return (self.root / self.ship.ventures_dir).resolve()
 
     @property
     def company_dir(self) -> Path:

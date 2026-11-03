@@ -74,6 +74,35 @@ def cmd_research(args, rt: Runtime) -> int:
     return rc
 
 
+def print_ship_log(o) -> None:
+    print(f"\n{o.ticket}: {o.status.upper()}" + (f" — {o.reason}" if o.reason else ""))
+    if o.steps:
+        print(f"  {'step':<24}{'result':<8}{'time':>9}  detail")
+        for s in o.steps:
+            detail = (s.get("url") or "") + ("  " if s.get("url") and s.get("detail") else "") + (s.get("detail") or "")
+            print(f"  {s['step']:<24}{s['status']:<8}{s['duration_s']:>8.1f}s  {detail[:110]}")
+    for k in ("preview_url", "prod_url", "transcript", "log_path"):
+        if getattr(o, k):
+            print(f"  {k.replace('_', ' ')}: {getattr(o, k)}")
+
+
+def cmd_build(args, rt: Runtime) -> int:
+    outs = rt.build(args.ticket, dry_run=args.dry_run)
+    if not outs:
+        print("no runnable claude-code tickets (todo, dependencies done, no pending spend request)")
+        return 0
+    for o in outs:
+        print_ship_log(o)
+    return 0 if all(o.status in ("shipped", "dry_run_ok") for o in outs) else 2
+
+
+def cmd_ticket_add(args, rt: Runtime) -> int:
+    tid = rt.add_ticket(title=args.title, owner=args.owner, venture=args.venture, criteria=args.criterion,
+                        description=args.description or "", depends_on=args.depends_on or [])
+    print(f"created {tid}")
+    return 0
+
+
 def cmd_plan(args, rt: Runtime) -> int:
     print("CEO agent: writing this week's plan…")
     o = rt.plan()
@@ -260,6 +289,18 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--all", action="store_true")
     s.set_defaults(fn=cmd_tickets)
     sub.add_parser("venture", help="show venture and stage history").set_defaults(fn=cmd_venture)
+    s = sub.add_parser("build", help="run claude-code tickets through Claude Code and the ship bar")
+    s.add_argument("--ticket", default=None)
+    s.add_argument("--dry-run", action="store_true", help="stop after the preview deploy + smoke test")
+    s.set_defaults(fn=cmd_build)
+    s = sub.add_parser("ticket-add", help="create a ticket by hand")
+    s.add_argument("--title", required=True)
+    s.add_argument("--owner", required=True, choices=["research", "claude-code"])
+    s.add_argument("--venture", default=None)
+    s.add_argument("--criterion", action="append", required=True, help="acceptance criterion (repeatable)")
+    s.add_argument("--description", default=None)
+    s.add_argument("--depends-on", action="append", default=None)
+    s.set_defaults(fn=cmd_ticket_add)
     args = p.parse_args(argv)
     if getattr(args, "n", 1) < 1:
         p.error("--n must be >= 1")

@@ -203,7 +203,11 @@ def gather_context(deps: CEODeps) -> str:
                 f"- {b['path']} — {b['title']} ({b['score']}/10)" for b in briefs))
     retro = latest_file(m, "retros")
     parts.append(f"## Last retro ({retro})\n{m.read(retro)[:3000]}" if retro else "## Last retro\nNone yet.")
-    open_t = deps.tickets.list(status=OPEN)
+    rescope = deps.tickets.list(status="needs_rescope")
+    if rescope:
+        parts.append("## Tickets that failed twice and need rescoping (claude-code)\n" + "\n".join(
+            f"- {t.id} {t.title} (attempts {t.attempts}): {t.last_error}" for t in rescope))
+    open_t = [t for t in deps.tickets.list(status=OPEN) if t.status != "needs_rescope"]
     parts.append("## Open tickets\n" + ("\n".join(
         f"- {t.id} [{t.owner}, {t.status}] {t.title}" + (f" (blocked: {t.blocked_reason})" if t.blocked_reason else "")
         for t in open_t) or "None."))
@@ -240,7 +244,9 @@ Rules:
 - Spending money is never automatic. Only add spend_requests when a ticket truly cannot proceed
   without it (e.g. a domain, an API plan); keep amounts small and justified. Tickets that need money
   list the spend key in needs_spend and stay blocked until a human approves.
-- No outbound messages to people, no ads, no deploys this week.
+- Tickets listed under "need rescoping" failed twice in the ship pipeline. Replace each with smaller,
+  clearer tickets (or drop the work) and say which ticket id it replaces in the description.
+- No outbound messages to people and no ads. Deploys happen only through the ship pipeline.
 - At most {MAX_TICKETS} tickets; acceptance criteria must be testable.
 
 Reply with ONE JSON object: {{"action": "final", "plan": {PLAN_SCHEMA}}}"""
