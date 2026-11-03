@@ -46,3 +46,11 @@ web_search:
   provider: ddgs          # free metasearch, no API key
   backends: [duckduckgo, google, brave, bing, mojeek]   # tried in order until one returns results
   max_results: 5
+
+validation:
+  go_threshold: 7         # go/no-go score (1-10) needed to move Validation → Build
+  max_steps: 14           # LLM steps for one validation report
+  max_tool_calls: 8       # web searches etc. for one validation report
+
+ceo:
+  max_steps: 3            # plan draft attempts (first try + repairs)

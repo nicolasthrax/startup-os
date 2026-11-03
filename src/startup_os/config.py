@@ -54,6 +54,16 @@ class WebSearchConfig(BaseModel):
     max_results: int = 5
 
 
+class ValidationConfig(BaseModel):
+    go_threshold: int = Field(default=7, ge=1, le=10)
+    max_steps: int = 14
+    max_tool_calls: int = 8
+
+
+class CEOConfig(BaseModel):
+    max_steps: int = 3          # draft attempts (initial + repairs) per plan
+
+
 class Config(BaseModel):
     root: Path = Path(".")
     paths: PathsConfig = PathsConfig()
@@ -61,6 +71,8 @@ class Config(BaseModel):
     budget: BudgetConfig = BudgetConfig()
     guards: GuardsConfig = GuardsConfig()
     web_search: WebSearchConfig = WebSearchConfig()
+    validation: ValidationConfig = ValidationConfig()
+    ceo: CEOConfig = CEOConfig()
 
     @property
     def company_dir(self) -> Path:

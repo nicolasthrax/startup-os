@@ -9,10 +9,17 @@ from .search_index import SearchIndex
 
 DIRS = ["plans", "decisions", "research", "research/ideas", "tickets", "retros"]
 
-VENTURE_TEMPLATE = """# Venture
+VENTURE_TEMPLATE = """---
+stage: Ideation
+name: null
+idea: null
+updated: null
+---
+
+# Venture
 
 _No venture selected yet. The Research agent writes idea briefs to `research/ideas/`;
-a later stage will pick one and record the decision in `decisions/`._
+`startup-os pick <brief>` selects one and moves the stage to Validation._
 """
 
 
@@ -77,12 +84,14 @@ class MemoryRepo:
             raise MemoryError("refusing to write inside .git")
         return p
 
-    def _commit(self, path: Path, agent: str, message: str) -> str:
-        rel = str(path.relative_to(self.root))
-        self._git("add", "--", rel)
+    def _commit(self, path: Path | list[Path], agent: str, message: str) -> str:
+        paths = path if isinstance(path, list) else [path]
+        rels = [str(p.relative_to(self.root)) for p in paths]
+        self._git("add", "--", *rels)
         if not self._git("diff", "--cached", "--name-only"):
             return self.head()  # no change
-        self._git("commit", "-q", "-m", f"{agent}: {message}", "-m", f"File: {rel}")
+        files = "File: " + rels[0] if len(rels) == 1 else "Files:\n" + "\n".join(f"- {r}" for r in rels)
+        self._git("commit", "-q", "-m", f"{agent}: {message}", "-m", files)
         sha = self.head()
         if self.index:
             self.index.rebuild()
@@ -94,6 +103,19 @@ class MemoryRepo:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
         return self._commit(p, agent, message)
+
+    def write_many(self, files: dict[str, str], *, agent: str, message: str) -> str:
+        """Write several files and commit them together (one commit)."""
+        paths = []
+        for rel, content in files.items():
+            p = self._resolve(rel)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content, encoding="utf-8")
+            paths.append(p)
+        return self._commit(paths, agent, message)
+
+    def exists(self, rel_path: str | Path) -> bool:
+        return self._resolve(rel_path).exists()
 
     def append_approval(self, line: str, *, agent: str) -> str:
         p = self._resolve("approvals.log")

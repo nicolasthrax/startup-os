@@ -28,6 +28,11 @@ CREATE TABLE IF NOT EXISTS usage (
     error TEXT
 );
 CREATE INDEX IF NOT EXISTS usage_day_agent ON usage(day, agent);
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS tasks (
     id TEXT PRIMARY KEY,
     agent TEXT NOT NULL,
@@ -139,8 +144,36 @@ class Scheduler:
         return c
 
     # -- quota -------------------------------------------------------------
+    def effective_shares(self) -> dict[str, float]:
+        """Config shares, overridden by the split of the latest approved plan."""
+        with self._conn() as c:
+            r = c.execute("SELECT value FROM settings WHERE key = 'budget_split'").fetchone()
+        if not r:
+            return dict(self.shares)
+        override = json.loads(r[0])["shares"]
+        return {a: override.get(a, 0) for a in set(self.shares) | set(override)}
+
+    def set_share_override(self, shares: dict[str, float] | None, source: str) -> None:
+        if shares is not None:
+            unknown = set(shares) - set(self.shares)
+            if unknown:
+                raise ValueError(f"unknown agents in budget split: {sorted(unknown)}")
+            if sum(shares.values()) > 100 + 1e-9:
+                raise ValueError(f"budget split sums to {sum(shares.values())} (> 100)")
+        with self._conn() as c:
+            if shares is None:
+                c.execute("DELETE FROM settings WHERE key = 'budget_split'")
+            else:
+                c.execute("INSERT OR REPLACE INTO settings(key, value, updated_at) VALUES ('budget_split', ?, ?)",
+                          (json.dumps({"shares": shares, "source": source}), self.now().isoformat()))
+
+    def share_source(self) -> str:
+        with self._conn() as c:
+            r = c.execute("SELECT value FROM settings WHERE key = 'budget_split'").fetchone()
+        return json.loads(r[0])["source"] if r else "config.yaml"
+
     def agent_limit(self, agent: str) -> int:
-        return int(self.daily_requests * self.shares.get(agent, 0) / 100)
+        return int(self.daily_requests * self.effective_shares().get(agent, 0) / 100)
 
     def today(self) -> str:
         return self.now().date().isoformat()
@@ -207,7 +240,7 @@ class Scheduler:
                 (day,),
             ).fetchall()
         used = {r["agent"]: dict(r) for r in rows}
-        agents = sorted(set(self.shares) | set(used))
+        agents = sorted(set(self.effective_shares()) | set(used))
         out = []
         for a in agents:
             r = used.get(a, {"requests": 0, "ok": 0, "rate_limited": 0, "errors": 0, "tokens": 0})
