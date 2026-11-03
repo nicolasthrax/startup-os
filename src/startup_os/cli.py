@@ -80,6 +80,7 @@ def print_ship_log(o) -> None:
         print(f"  {'step':<24}{'result':<8}{'time':>9}  detail")
         for s in o.steps:
             detail = (s.get("url") or "") + ("  " if s.get("url") and s.get("detail") else "") + (s.get("detail") or "")
+            detail = " ".join(detail.split())       # one line per step
             print(f"  {s['step']:<24}{s['status']:<8}{s['duration_s']:>8.1f}s  {detail[:110]}")
     for k in ("preview_url", "prod_url", "transcript", "log_path"):
         if getattr(o, k):
