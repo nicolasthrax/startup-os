@@ -157,9 +157,9 @@ BRIEF_SCHEMA = """{
 }"""
 
 
-def system_prompt(toolbox: Toolbox) -> str:
+def system_prompt(toolbox: Toolbox, max_tools: int | None = None) -> str:
     web = toolbox.web_enabled
-    return f"""You are the Research agent of Startup OS, an autonomous startup studio.
+    return (f"""You are the Research agent of Startup OS, an autonomous startup studio.
 Your job: turn a startup idea seed into a rigorous, skeptical idea brief.
 
 You can call tools. Available tools:
@@ -171,10 +171,11 @@ or, when you are done, the final brief:
 {{"action": "final", "brief": {BRIEF_SCHEMA}}}
 
 Rules:
-- {"Use web_search 1-3 times to ground competitors and demand evidence before finalising. " if web else "No web access is available: rely on your own knowledge and say so in the demand reasoning. "}Never repeat an identical tool call.
+- You have at most {{max_tools}} tool calls for this brief. {"Use web_search 1-3 times to ground competitors and demand evidence before finalising. " if web else "No web access is available: rely on your own knowledge and say so in the demand reasoning. "}Never repeat an identical tool call.
 - Be honest and calibrated: the demand-signal score is 1 (no evidence anyone wants this) to 10 (strong, proven willingness to pay). Most ideas deserve 3-6.
 - Name real competitors where you know them. Kill criteria must be measurable within weeks (e.g. "<5 of 20 interviewed ops leads report this pain monthly").
-- Prefer ideas a tiny team can ship as a software MVP in weeks with no regulated activities."""
+- Prefer ideas a tiny team can ship as a software MVP in weeks with no regulated activities.""").replace(
+        "{max_tools}", str(max_tools) if max_tools else "a few")
 
 
 def render_brief(brief: IdeaBrief, *, seed: dict, run_id: str, models: list[str],
@@ -256,7 +257,7 @@ Reply with JSON: {{"ideas": [{{"title": "...", "one_liner": "...", "target_custo
         log.event("node", node="start_idea", idx=state["idx"], seed=s)
         return {
             "messages": [
-                {"role": "system", "content": system_prompt(toolbox)},
+                {"role": "system", "content": system_prompt(toolbox, guard.max_tool_calls)},
                 {"role": "user", "content": "Research this idea seed and produce the brief:\n"
                                             + json.dumps(s, ensure_ascii=False, indent=2)},
             ],
@@ -304,9 +305,16 @@ Reply with JSON: {{"ideas": [{{"title": "...", "one_liner": "...", "target_custo
         call = state["pending_tool"]
         out = toolbox.run(call["name"], call["args"])
         result = json.dumps(out["result"], ensure_ascii=False, default=str)[:TOOL_RESULT_CHARS]
+        used = len(state["tool_sigs"])
+        if guard.max_tool_calls is None:
+            budget = ""
+        elif used >= guard.max_tool_calls:
+            budget = f"\n\n[Tool budget used up ({used}/{guard.max_tool_calls}). Reply with the final brief now.]"
+        else:
+            budget = f"\n\n[Tool calls used: {used}/{guard.max_tool_calls}.]"
         upd: dict = {"pending_tool": None,
                      "messages": state["messages"] + [{"role": "user", "content":
-                                 f"TOOL RESULT ({call['name']}): {result}"}]}
+                                 f"TOOL RESULT ({call['name']}): {result}{budget}"}]}
         if call["name"] == "web_search":
             upd["web_attempts"] = state["web_attempts"] + 1
             if out["ok"]:

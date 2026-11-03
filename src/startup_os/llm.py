@@ -88,7 +88,12 @@ class ModelRouter:
                 resp = self.call_fn(model, messages, **kwargs)
                 if not resp.text or not resp.text.strip():
                     raise RuntimeError("empty completion")
-            except Exception as exc:  # noqa: BLE001 - any failure → next model
+            except BaseException as exc:
+                if not isinstance(exc, Exception):  # KeyboardInterrupt / SystemExit
+                    self.scheduler.record(usage_id, model=model, status="interrupted",
+                                          error=repr(exc))
+                    raise
+                # any other failure → next model
                 status = "rate_limited" if is_rate_limit(exc) else "error"
                 latency = int((time.monotonic() - t0) * 1000)
                 self.scheduler.record(usage_id, model=model, status=status,

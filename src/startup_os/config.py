@@ -44,11 +44,13 @@ class BudgetConfig(BaseModel):
 class GuardsConfig(BaseModel):
     max_steps_per_task: int = 8
     max_identical_tool_calls: int = 2
+    max_tool_calls_per_task: int = 4
 
 
 class WebSearchConfig(BaseModel):
     enabled: bool = True
-    provider: str = "duckduckgo"
+    provider: str = "ddgs"
+    backends: list[str] = Field(default_factory=lambda: ["duckduckgo", "google", "brave", "bing", "mojeek"])
     max_results: int = 5
 
 

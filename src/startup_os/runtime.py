@@ -14,7 +14,7 @@ from .llm import AllModelsFailed, CallFn, ModelRouter, openrouter_call_fn
 from .memory import MemoryRepo
 from .runlog import RunLog
 from .search_index import SearchIndex
-from .tools import Toolbox, duckduckgo_search
+from .tools import Toolbox, web_search
 
 
 class MissingAPIKey(Exception):
@@ -33,7 +33,7 @@ class TaskOutcome:
 
 
 class Runtime:
-    def __init__(self, cfg: Config, *, call_fn: CallFn | None = None, web_search_fn=duckduckgo_search,
+    def __init__(self, cfg: Config, *, call_fn: CallFn | None = None, web_search_fn=None,
                  scheduler: Scheduler | None = None):
         self.cfg = cfg
         cfg.data_dir.mkdir(parents=True, exist_ok=True)
@@ -42,7 +42,9 @@ class Runtime:
         self.memory.ensure()
         self.scheduler = scheduler or Scheduler.from_config(cfg)
         self._call_fn = call_fn
-        self.web_search_fn = web_search_fn
+        backends = cfg.web_search.backends
+        self.web_search_fn = web_search_fn or (lambda q, n: web_search(q, n, backends))
+        self.recovered = self.scheduler.recover_interrupted(stale_after_s=cfg.llm.timeout_s * 2)
 
     def call_fn(self) -> CallFn:
         if self._call_fn is None:
@@ -70,7 +72,8 @@ class Runtime:
         toolbox = Toolbox(self.index, web_enabled=cfg.web_search.enabled,
                           web_max_results=cfg.web_search.max_results,
                           web_search_fn=self.web_search_fn, run_log=log)
-        guard = LoopGuard(cfg.guards.max_steps_per_task, cfg.guards.max_identical_tool_calls)
+        guard = LoopGuard(cfg.guards.max_steps_per_task, cfg.guards.max_identical_tool_calls,
+                          cfg.guards.max_tool_calls_per_task)
         graph = build_research_graph(ResearchDeps(router, self.memory, toolbox, guard, log),
                                      checkpointer=self._checkpointer())
         run_cfg = {"configurable": {"thread_id": task["thread_id"]},
@@ -84,6 +87,11 @@ class Runtime:
             log.close("deferred", reason=str(e), retry_at=e.retry_at)
             return TaskOutcome(task["id"], "deferred", snap.get("written", []), snap.get("failed", []),
                                str(e), log.run_id, str(log.path))
+        except KeyboardInterrupt:
+            # Resumable from the checkpoint: queue it to run again right away.
+            self.scheduler.defer(task["id"], self.scheduler.now(), "interrupted by user")
+            log.close("interrupted")
+            raise
         except Exception as e:
             self.scheduler.set_status(task["id"], "failed", reason=repr(e)[:500])
             log.close("failed", error=repr(e))

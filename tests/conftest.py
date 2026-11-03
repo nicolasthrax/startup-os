@@ -62,9 +62,9 @@ class ScriptedLLM:
         if not self.script:
             raise AssertionError("ScriptedLLM ran out of replies")
         item = self.script.pop(0)
-        if callable(item) and not isinstance(item, Exception):
+        if callable(item) and not isinstance(item, BaseException):
             item = item(model, messages)
-        if isinstance(item, Exception):
+        if isinstance(item, BaseException):
             raise item
         return CallResponse(text=item, prompt_tokens=100, completion_tokens=50)
 

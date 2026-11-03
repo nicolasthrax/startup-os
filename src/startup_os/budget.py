@@ -3,6 +3,7 @@ a usage log and a queue of deferred tasks, all in SQLite."""
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -18,7 +19,7 @@ CREATE TABLE IF NOT EXISTS usage (
     day TEXT NOT NULL,
     agent TEXT NOT NULL,
     model TEXT,
-    status TEXT NOT NULL,          -- reserved | ok | rate_limited | error
+    status TEXT NOT NULL,          -- reserved | ok | rate_limited | error | interrupted
     prompt_tokens INTEGER DEFAULT 0,
     completion_tokens INTEGER DEFAULT 0,
     total_tokens INTEGER DEFAULT 0,
@@ -36,6 +37,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     status TEXT NOT NULL,          -- running | deferred | done | failed
     run_after TEXT,
     reason TEXT,
+    pid INTEGER,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -117,6 +119,9 @@ class Scheduler:
         self.bucket = bucket or TokenBucket(per_minute)
         with self._conn() as c:
             c.executescript(SCHEMA)
+            cols = {r[1] for r in c.execute("PRAGMA table_info(tasks)")}
+            if "pid" not in cols:  # migrate DBs created before the pid column
+                c.execute("ALTER TABLE tasks ADD COLUMN pid INTEGER")
 
     @classmethod
     def from_config(cls, cfg, **kw) -> "Scheduler":
@@ -217,9 +222,9 @@ class Scheduler:
         thread_id = thread_id or f"{agent}-{tid}"
         with self._conn() as c:
             c.execute(
-                "INSERT INTO tasks(id, agent, kind, payload, thread_id, status, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, 'running', ?, ?)",
-                (tid, agent, kind, json.dumps(payload), thread_id, now, now),
+                "INSERT INTO tasks(id, agent, kind, payload, thread_id, status, pid, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, 'running', ?, ?, ?)",
+                (tid, agent, kind, json.dumps(payload), thread_id, os.getpid(), now, now),
             )
         return self.get_task(tid)
 
@@ -234,10 +239,11 @@ class Scheduler:
 
     def set_status(self, task_id: str, status: str, *, run_after: datetime | None = None,
                    reason: str | None = None) -> None:
+        pid = os.getpid() if status == "running" else None
         with self._conn() as c:
             c.execute(
-                "UPDATE tasks SET status=?, run_after=?, reason=?, updated_at=? WHERE id=?",
-                (status, run_after.isoformat() if run_after else None, reason,
+                "UPDATE tasks SET status=?, run_after=?, reason=?, pid=?, updated_at=? WHERE id=?",
+                (status, run_after.isoformat() if run_after else None, reason, pid,
                  self.now().isoformat(), task_id),
             )
 
@@ -259,3 +265,36 @@ class Scheduler:
             t for t in self.list_tasks("deferred")
             if t["run_after"] is None or datetime.fromisoformat(t["run_after"]) <= now
         ]
+
+    # -- crash recovery -------------------------------------------------------
+    @staticmethod
+    def _pid_alive(pid: int | None) -> bool:
+        if not pid:
+            return False
+        if pid == os.getpid():
+            return True
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    def recover_interrupted(self, stale_after_s: float = 180) -> list[str]:
+        """Requeue tasks left 'running' by a process that died, and close out usage
+        rows left 'reserved' by an in-flight call that never returned. Interrupted
+        tasks resume from their checkpoint via `run-due`. Returns requeued task ids."""
+        now = self.now()
+        requeued = []
+        for t in self.list_tasks("running"):
+            if not self._pid_alive(t.get("pid")):
+                self.defer(t["id"], now, "interrupted: process exited mid-run")
+                requeued.append(t["id"])
+        cutoff = (now - timedelta(seconds=stale_after_s)).isoformat()
+        with self._conn() as c:
+            c.execute(
+                "UPDATE usage SET status='interrupted', error='no response recorded' "
+                "WHERE status='reserved' AND ts < ?", (cutoff,),
+            )
+        return requeued

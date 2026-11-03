@@ -39,8 +39,10 @@ budget:
 guards:
   max_steps_per_task: 8          # LLM steps per idea brief before forcing a final answer
   max_identical_tool_calls: 2    # the 2nd identical call (same tool + args) stops the loop
+  max_tool_calls_per_task: 4     # tool calls per brief; after that the agent must finalise
 
 web_search:
   enabled: true
-  provider: duckduckgo    # free, no API key
+  provider: ddgs          # free metasearch, no API key
+  backends: [duckduckgo, google, brave, bing, mojeek]   # tried in order until one returns results
   max_results: 5

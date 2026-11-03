@@ -8,12 +8,31 @@ from .runlog import NullRunLog, RunLog
 from .search_index import SearchIndex
 
 
-def duckduckgo_search(query: str, max_results: int = 5) -> list[dict]:
+DEFAULT_BACKENDS = ("duckduckgo", "google", "brave", "bing", "mojeek")
+
+
+def web_search(query: str, max_results: int = 5,
+               backends: tuple[str, ...] | list[str] = DEFAULT_BACKENDS) -> list[dict]:
+    """Free web search via `ddgs`. Tries each backend in order and returns the first
+    non-empty result set; raises the last error if every backend fails."""
     from ddgs import DDGS
 
-    results = DDGS().text(query, max_results=max_results) or []
-    return [{"title": r.get("title"), "url": r.get("href"), "snippet": r.get("body")}
-            for r in results]
+    last_exc: Exception | None = None
+    for backend in backends:
+        try:
+            results = DDGS().text(query, max_results=max_results, backend=backend) or []
+        except Exception as exc:  # noqa: BLE001 - "No results found", blocks, timeouts
+            last_exc = exc
+            continue
+        if results:
+            return [{"title": r.get("title"), "url": r.get("href"), "snippet": r.get("body"),
+                     "backend": backend} for r in results]
+    if last_exc:
+        raise last_exc
+    return []
+
+
+duckduckgo_search = web_search  # backwards-compatible name
 
 
 class Toolbox:
@@ -35,7 +54,7 @@ class Toolbox:
     def describe(self) -> str:
         lines = ['- search(query): full-text search over the company memory repo (past briefs, decisions, plans).']
         if self.web_enabled:
-            lines.append("- web_search(query): free web search (DuckDuckGo). Use it to find competitors, "
+            lines.append("- web_search(query): free web search. Use it to find competitors, "
                          "pricing, market data and demand evidence. Returns titles, URLs and snippets.")
         return "\n".join(lines)
 

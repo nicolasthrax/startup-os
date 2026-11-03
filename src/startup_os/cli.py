@@ -110,6 +110,9 @@ def main(argv: list[str] | None = None) -> int:
         p.error("--n must be >= 1")
     try:
         rt = Runtime(load_config(args.config))
+        if rt.recovered:
+            print(f"note: requeued {len(rt.recovered)} interrupted task(s) "
+                  f"({', '.join(rt.recovered)}); run `startup-os run-due` to resume them.")
         return args.fn(args, rt)
     except MissingAPIKey as e:
         print(f"error: {e}", file=sys.stderr)
