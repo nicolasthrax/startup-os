@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 from .. import frontmatter
 from ..approvals import ApprovalQueue
 from ..budget import BudgetExceeded, Scheduler
+from ..config import BUDGET_AGENTS, split_problem
 from ..guards import LoopGuard, LoopGuardTripped
 from ..llm import AllModelsFailed, ModelRouter
 from ..memory import MemoryRepo
@@ -27,6 +28,7 @@ from ..spend import SpendGate
 from ..tickets import OPEN, Owner, Ticket, TicketStore
 from ..venture import ALLOWED, Decision, Stage, TransitionError, Venture
 from .research import IDEAS_DIR, extract_json
+from ..paths import check_path, filter_paths
 from .validation import latest_report
 
 AGENT = "ceo"
@@ -48,6 +50,7 @@ class PlanTicket(BaseModel):
     acceptance_criteria: list[str] = Field(min_length=1)
     depends_on: list[str] = Field(default_factory=list)   # other plan keys or existing T-xxxx
     needs_spend: list[str] = Field(default_factory=list)  # spend request keys
+    inputs: list[str] = Field(default_factory=list)       # company/ files the owner should read
 
     @field_validator("owner", mode="before")
     @classmethod
@@ -98,12 +101,13 @@ PLAN_SCHEMA = """{
   "summary": "2-4 sentences: where we are and the focus this week",
   "goals": ["1-5 measurable goals for this week"],
   "tickets": [{"key": "t1", "title": "...", "owner": "research|claude-code", "description": "...",
-               "acceptance_criteria": ["testable"], "depends_on": ["t0 or T-0001"], "needs_spend": ["s1"]}],
-  "budget_split": {"<agent>": percent, ...},
+               "acceptance_criteria": ["testable"], "depends_on": ["t0 or T-0001"], "needs_spend": ["s1"],
+               "inputs": ["existing company/ file paths to read, e.g. research/validation/<file>.md"]}],
+  "budget_split": {"ceo": percent, "research": percent, "reserve": percent},
   "budget_rationale": "why this split",
   "spend_requests": [{"key": "s1", "item": "...", "amount_usd": 12.0, "vendor": "...", "recurring": "monthly|null", "justification": "..."}],
   "stage_change": null or {"to": "Build|Ideation|...", "what": "...", "why": "...", "alternatives": ["..."]},
-  "idea_pick": null or {"brief": "research/ideas/<file>.md", "why": "..."},
+  "idea_pick": null or {"brief": "research/ideas/<existing file>.md", "why": "..."},  (a recommendation only)
   "risks": ["..."]
 }"""
 
@@ -119,6 +123,7 @@ class PlanState(TypedDict, total=False):
     plan_path: str | None
     approval: str | None
     notes: list[str]
+    recommendation: dict | None
 
 
 @dataclass
@@ -154,6 +159,12 @@ def latest_file(memory: MemoryRepo, folder: str) -> str | None:
     return str(files[-1].relative_to(memory.root)) if files else None
 
 
+def report_score(report: dict) -> float:
+    """The unrounded weighted score when present (older reports only have go_score)."""
+    v = report.get("go_weighted")
+    return float(v if v is not None else (report.get("go_score") or 0))
+
+
 def stage_policy(to: Stage, current: Stage, report: dict | None, threshold: int) -> str | None:
     """Return a reason the transition is NOT allowed, or None if it is."""
     if to not in ALLOWED[current]:
@@ -161,10 +172,9 @@ def stage_policy(to: Stage, current: Stage, report: dict | None, threshold: int)
     if current == Stage.VALIDATION and to == Stage.BUILD:
         if not report:
             return "Validation → Build needs a validation report"
-        if (report.get("go_score") or 0) < threshold:
-            return f"validation score {report.get('go_score')}/10 is below the go threshold {threshold}"
-    if current == Stage.VALIDATION and to == Stage.IDEATION and report and \
-            (report.get("go_score") or 0) >= threshold:
+        if report_score(report) < threshold:
+            return f"validation score {report_score(report):g}/10 is below the go threshold {threshold}"
+    if current == Stage.VALIDATION and to == Stage.IDEATION and report and report_score(report) >= threshold:
         return "validation says GO; dropping the idea needs a human decision"
     return None
 
@@ -187,6 +197,10 @@ def gather_context(deps: CEODeps) -> str:
             parts.append("## Latest research\nNo validation report yet for this venture.")
         if v.idea and m.exists(v.idea):
             parts.append(f"## Picked idea brief ({v.idea})\n{m.read(v.idea)[:4000]}")
+        briefs = list_briefs(m)
+        if briefs:
+            parts.append("## All idea brief files (the only brief paths that exist)\n" + "\n".join(
+                f"- {b['path']} — {b['title']} ({b['score']}/10)" for b in briefs))
     retro = latest_file(m, "retros")
     parts.append(f"## Last retro ({retro})\n{m.read(retro)[:3000]}" if retro else "## Last retro\nNone yet.")
     open_t = deps.tickets.list(status=OPEN)
@@ -210,14 +224,19 @@ and write the weekly plan. Be concrete, frugal and skeptical.
 Agents you can assign tickets to:
 - research: market/competitor/customer research (web search + reasoning). Cannot talk to people.
 - claude-code: writes and ships code. Tickets for it are queued for later; only create them when the
-  stage is Build or later, or when a stage change to Build is part of this plan.
+  stage is Build or later, or when a stage change to Build is part of this plan. Claude Code runs on a
+  separate subscription: it uses NO OpenRouter quota and never appears in budget_split.
 
 Rules:
 - Stage changes need evidence. Validation → Build only if the latest validation report's go score is
   >= {deps.go_threshold}; if it is below, move back to Ideation (or keep validating if evidence is thin).
   Every stage change needs what/why/alternatives.
-- In Ideation with no venture, you may propose idea_pick (a brief path) for the human to approve.
-- budget_split: percentages per agent across exactly these agents: {deps.agents}. Sum <= 100.
+- In Ideation you may RECOMMEND one idea_pick (an existing brief path from the list above). Picks are the
+  human's decision; you never pick.
+- Only reference files that exist in company/ (paths listed in the context). Tickets whose inputs name
+  unknown files are dropped.
+- budget_split: OpenRouter call-budget percentages for exactly these keys and no others: {deps.agents}.
+  Sum <= 100. Any other key (e.g. claude-code, engineer, product) makes the plan invalid.
 - Spending money is never automatic. Only add spend_requests when a ticket truly cannot proceed
   without it (e.g. a domain, an API plan); keep amounts small and justified. Tickets that need money
   list the spend key in needs_spend and stay blocked until a human approves.
@@ -231,13 +250,14 @@ Reply with ONE JSON object: {{"action": "final", "plan": {PLAN_SCHEMA}}}"""
 def render_plan(*, week: str, draft: PlanDraft, venture_name: str | None, stage: str,
                 tickets: list[Ticket], spend: list[dict], approval: dict, shares_now: dict,
                 daily: int, notes: list[str], run_id: str, models: list[str], created: str,
-                ticket_paths: dict[str, str] | None = None) -> str:
+                ticket_paths: dict[str, str] | None = None, recommendation: dict | None = None) -> str:
     ticket_paths = ticket_paths or {}
     meta = {"week": week, "status": "pending_approval", "approval": approval["ref"],
             "auto_approve_at": approval["auto_approve_at"], "venture": venture_name, "stage": stage,
             "created": created, "agent": AGENT, "run_id": run_id, "models": sorted(set(models)),
             "budget_split": draft.budget_split, "tickets": [t.id for t in tickets],
-            "spend_requests": [s["ref"] for s in spend]}
+            "spend_requests": [s["ref"] for s in spend],
+            "recommended_pick": recommendation["brief"] if recommendation else None}
     L = [f"# Plan {week} — {venture_name or 'no venture yet'} ({stage})", "", f"> {draft.summary}", "",
          "## Goals", ""] + [f"{i}. {g}" for i, g in enumerate(draft.goals, 1)]
     L += ["", "## Tickets", ""]
@@ -265,6 +285,10 @@ def render_plan(*, week: str, draft: PlanDraft, venture_name: str | None, stage:
               for s in spend]
     else:
         L.append("None.")
+    if recommendation:
+        L += ["", "## Recommended idea pick (your decision)", "",
+              f"The CEO recommends [{recommendation['brief']}](../{recommendation['brief']}): {recommendation['why']}",
+              "", "Picks are yours. To accept:", "", f"    startup-os pick {recommendation['brief']}"]
     if notes:
         L += ["", "## Stage and decisions", ""] + [f"- {n}" for n in notes]
     if draft.risks:
@@ -319,21 +343,22 @@ def build_plan_graph(deps: CEODeps, checkpointer=None):
             if why_not:
                 notes.append(f"Proposed stage change to {d.stage_change.to.value} was **refused by policy**: {why_not}.")
             else:
-                why = d.stage_change.why + (f" (evidence: {rep[0]}, score {rep[1].get('go_score')}/10)" if rep else "")
+                why = d.stage_change.why + (f" (evidence: {rep[0]}, weighted score {report_score(rep[1]):g}/10)" if rep else "")
                 rel = deps.venture.transition(d.stage_change.to, Decision(
                     what=d.stage_change.what, why=why, alternatives=d.stage_change.alternatives,
                     decided_by="ceo"), agent=AGENT)
                 notes.append(f"Stage changed {v.stage.value} → {d.stage_change.to.value}; decision record: [{rel}](../{rel}).")
                 v = deps.venture.load()
 
-        # 2. idea pick proposal → approval (human decides)
+        # 2. idea pick: the CEO may only recommend; picks are the human's (`startup-os pick <file>`)
+        recommendation = None
         if d.idea_pick and v.stage == Stage.IDEATION:
-            if deps.memory.exists(d.idea_pick.brief):
-                a = deps.approvals.create("idea_pick", f"Pick {d.idea_pick.brief}",
-                                          {"brief": d.idea_pick.brief, "why": d.idea_pick.why}, requested_by=AGENT)
-                notes.append(f"Proposed idea pick {d.idea_pick.brief} as {a['ref']} (needs human approval).")
+            rel, problem = check_path(deps.memory, d.idea_pick.brief, under=IDEAS_DIR, suffix=".md")
+            if problem:
+                log.event("invalid_path", agent=AGENT, item="idea_pick", path=d.idea_pick.brief, reason=problem)
+                notes.append(f"Dropped idea-pick recommendation: `{d.idea_pick.brief}` is invalid ({problem}).")
             else:
-                notes.append(f"Ignored idea pick for missing brief {d.idea_pick.brief}.")
+                recommendation = {"brief": rel, "why": d.idea_pick.why}
 
         # 3. supersede an earlier pending plan for the same week, cancel its open tickets
         for a in deps.approvals.list(status="pending", kind="plan_approval"):
@@ -345,6 +370,29 @@ def build_plan_graph(deps: CEODeps, checkpointer=None):
                     deps.memory.write_many(deps.tickets.files_for(stale), agent=AGENT,
                                            message=f"cancel tickets of superseded plan {week}")
                 notes.append(f"Supersedes earlier plan approval {a['ref']}.")
+
+        # 3b. every referenced path must exist in company/; a ticket with an unknown path is dropped,
+        #     and so is any ticket that depends on a dropped one
+        valid_tickets, dropped = [], set()
+        for t in d.tickets:
+            ok, bad = filter_paths(deps.memory, t.inputs, agent=AGENT, item=f"ticket {t.key}", log=log)
+            if bad:
+                dropped.add(t.key)
+                notes.append(f"Dropped ticket \"{t.title}\": unknown file(s) "
+                             + ", ".join(f"`{b['path']}` ({b['reason']})" for b in bad) + ".")
+            else:
+                valid_tickets.append(t.model_copy(update={"inputs": ok}))
+        changed = True
+        while changed:
+            changed = False
+            for t in list(valid_tickets):
+                if any(dep in dropped for dep in t.depends_on):
+                    valid_tickets.remove(t)
+                    dropped.add(t.key)
+                    changed = True
+                    log.event("invalid_dependency", agent=AGENT, item=f"ticket {t.key}", depends_on=t.depends_on)
+                    notes.append(f"Dropped ticket \"{t.title}\": it depends on a dropped ticket.")
+        d = d.model_copy(update={"tickets": valid_tickets})
 
         # 4. spend requests go through the spend gate only
         spend_ref: dict[str, str] = {}
@@ -365,7 +413,7 @@ def build_plan_graph(deps: CEODeps, checkpointer=None):
         tickets = []
         for t in d.tickets:
             deps_ = [key_to_id.get(x, x) for x in t.depends_on] + [spend_ref[x] for x in t.needs_spend if x in spend_ref]
-            tickets.append(Ticket(id=key_to_id[t.key], title=t.title, owner=t.owner, kind="task",
+            tickets.append(Ticket(id=key_to_id[t.key], title=t.title, owner=t.owner, kind="task", inputs=t.inputs,
                                   description=t.description, acceptance_criteria=t.acceptance_criteria,
                                   depends_on=deps_, created=created, created_by=AGENT, plan=week, venture=v.name))
         # status from dependencies (spend approvals are pending → blocked)
@@ -399,13 +447,14 @@ def build_plan_graph(deps: CEODeps, checkpointer=None):
                               shares_now=deps.scheduler.effective_shares(), daily=deps.scheduler.daily_requests,
                               notes=notes, run_id=state.get("run_id", log.run_id),
                               models=state["models_used"], created=created,
-                              ticket_paths={t.id: path for path, t in zip(deps.tickets.files_for(final), final)})
+                              ticket_paths={t.id: path for path, t in zip(deps.tickets.files_for(final), final)},
+                              recommendation=recommendation)
         sha = deps.memory.write_many({rel: content, **deps.tickets.files_for(final)}, agent=AGENT,
                                      message=f"plan {week}: {len(final)} tickets, {len(spend_rows)} spend requests "
                                              f"(awaiting {approval['ref']})")
         log.event("plan_written", path=rel, commit=sha, approval=approval["ref"],
                   tickets=[t.id for t in final], spend=[s["ref"] for s in spend_rows], notes=notes)
-        return {"plan_path": rel, "approval": approval["ref"], "notes": notes}
+        return {"plan_path": rel, "approval": approval["ref"], "notes": notes, "recommendation": recommendation}
 
     def route(state: PlanState) -> str:
         return "write_plan" if state.get("draft") else "draft"
@@ -423,13 +472,9 @@ def build_plan_graph(deps: CEODeps, checkpointer=None):
 
 def check_draft(d: PlanDraft, deps: CEODeps) -> list[str]:
     problems = []
-    unknown = set(d.budget_split) - set(deps.agents)
-    if unknown:
-        problems.append(f"budget_split has unknown agents {sorted(unknown)}; use only {deps.agents}")
-    if sum(d.budget_split.values()) > 100 + 1e-9:
-        problems.append(f"budget_split sums to {sum(d.budget_split.values()):g}%, must be <= 100")
-    if any(v < 0 for v in d.budget_split.values()):
-        problems.append("budget_split percentages must be >= 0")
+    bad_split = split_problem(d.budget_split)
+    if bad_split:
+        problems.append(f"budget_split {bad_split}")
     keys = [t.key for t in d.tickets]
     if len(set(keys)) != len(keys):
         problems.append("ticket keys must be unique")

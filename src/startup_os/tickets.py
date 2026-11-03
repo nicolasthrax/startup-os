@@ -39,6 +39,7 @@ class Ticket(BaseModel):
     created_by: str = "ceo"
     plan: str | None = None
     venture: str | None = None
+    inputs: list[str] = Field(default_factory=list)   # company/ files to read (validated)
     blocked_reason: str | None = None
     result: str | None = None
     description: str = ""          # Markdown body, not front matter
@@ -72,8 +73,10 @@ class Ticket(BaseModel):
 
     def to_markdown(self) -> str:
         meta = self.model_dump(exclude={"description"}, exclude_none=True)
-        body = [f"# {self.id}: {self.title}", "", self.description.strip() or "_No description._", "",
-                "## Acceptance criteria", ""] + [f"- [ ] {c}" for c in self.acceptance_criteria]
+        body = [f"# {self.id}: {self.title}", "", self.description.strip() or "_No description._", ""]
+        if self.inputs:
+            body += ["## Inputs", ""] + [f"- [{p}](../{p})" for p in self.inputs] + [""]
+        body += ["## Acceptance criteria", ""] + [f"- [ ] {c}" for c in self.acceptance_criteria]
         if self.result:
             body += ["", "## Result", "", self.result]
         return frontmatter.dump(meta, "\n".join(body) + "\n")
@@ -83,7 +86,7 @@ class Ticket(BaseModel):
         meta, body = frontmatter.parse(text)
         if not meta:
             raise TicketError("ticket has no front matter")
-        m = re.search(r"\A#[^\n]*\n+(.*?)(?:\n## Acceptance criteria|\Z)", body, re.DOTALL)
+        m = re.search(r"\A#[^\n]*\n+(.*?)(?:\n## (?:Inputs|Acceptance criteria)|\Z)", body, re.DOTALL)
         desc = m.group(1).strip() if m else ""
         return cls(**meta, description="" if desc == "_No description._" else desc)
 

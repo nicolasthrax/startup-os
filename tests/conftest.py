@@ -94,7 +94,8 @@ def cfg_path(tmp_path) -> Path:
     cfg = {
         "paths": {"company": "company", "data": "data", "logs": "logs"},
         "llm": {"models": ["m1:free", "m2:free", "m3:free"], "defer_hours_on_failure": 1},
-        "budget": {"daily_requests": 1000, "per_minute": 1000, "agents": {"research": 50}},
+        "budget": {"daily_requests": 1000, "per_minute": 1000,
+                   "agents": {"research": 50, "ceo": 30, "reserve": 20}},
         "guards": {"max_steps_per_task": 4, "max_identical_tool_calls": 2},
         "web_search": {"enabled": True, "max_results": 3},
     }

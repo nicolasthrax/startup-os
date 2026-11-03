@@ -29,12 +29,12 @@ budget:
   daily_requests: 1000    # every LLM request attempt (including fallbacks) counts
   per_minute: 20          # token-bucket rate limit
   # Share of the daily quota per agent, in percent (must sum to <= 100).
+  # Exactly these three agents. Claude Code uses a separate subscription and
+  # never draws on OpenRouter quota, so it has no share here.
   agents:
-    research: 40
+    research: 65
     ceo: 25
-    product: 15
-    engineer: 15
-    reserve: 5
+    reserve: 10
 
 guards:
   max_steps_per_task: 8          # LLM steps per idea brief before forcing a final answer
@@ -51,6 +51,10 @@ validation:
   go_threshold: 7         # go/no-go score (1-10) needed to move Validation → Build
   max_steps: 14           # LLM steps for one validation report
   max_tool_calls: 8       # web searches etc. for one validation report
+
+research_tickets:         # `startup-os research`: any open research ticket (non-validation)
+  max_steps: 12
+  max_tool_calls: 6
 
 ceo:
   max_steps: 3            # plan draft attempts (first try + repairs)

@@ -47,7 +47,7 @@ def report_json(score):
         "demand_signals": [{"signal": "40% of orders by phone", "strength": "Moderate", "source": "https://s.example"}],
         "kill_criteria_check": [{"criterion": "<5 of 20", "status": "Unknown", "evidence": "no interviews"}],
         "risks": ["integration effort"],
-        "go_no_go": {"score": score, "reasoning": "because"},
+        "go_no_go": {"breakdown": [{"factor": "overall", "weight": 1, "score": score}], "reasoning": "because"},
         "evidence_links": ["https://s.example", "https://made-up.example"]}})
 
 
@@ -59,7 +59,7 @@ def plan_json(stage_to=None, spend=True, split=None):
              "acceptance_criteria": ["10 questions"]},
             {"key": "t2", "title": "Build reorder MVP", "owner": "Claude Code",
              "acceptance_criteria": ["tests pass"], "depends_on": ["t1"], "needs_spend": ["s1"] if spend else []}],
-        "budget_split": split or {"research": 30, "ceo": 10, "engineer": 40, "product": 10, "reserve": 5},
+        "budget_split": split or {"research": 70, "ceo": 20, "reserve": 10},
         "budget_rationale": "build week",
         "spend_requests": [{"key": "s1", "item": "Domain reorderhub.io", "amount_usd": 12,
                             "justification": "landing page"}] if spend else [],
@@ -77,7 +77,7 @@ def web(q, n):
 def rt(cfg_path, clock):
     import yaml
     cfg = yaml.safe_load(cfg_path.read_text())
-    cfg["budget"]["agents"] = {"research": 40, "ceo": 25, "product": 15, "engineer": 15, "reserve": 5}
+    cfg["budget"]["agents"] = {"research": 65, "ceo": 25, "reserve": 10}
     cfg_path.write_text(yaml.safe_dump(cfg))
     llm = ScriptedLLM([])
     r = Runtime(load_config(cfg_path), call_fn=llm, web_search_fn=web, now=clock.now)
@@ -110,7 +110,7 @@ def test_pick_moves_to_validation_with_decision_and_ticket(rt):
 
 def test_pick_falls_back_to_template_ticket_when_llm_fails(rt):
     rt.llm.script = [HTTP429("a"), HTTP429("b"), HTTP429("c")]
-    r = rt.pick("reorderhub")
+    r = rt.pick("research/ideas/2026-11-03-reorderhub.md")
     assert r["ticket_source"] == "template" and rt.tickets.get(r["ticket"]).kind == "validation"
 
 
@@ -153,7 +153,7 @@ def test_plan_after_go_moves_to_build_files_spend_and_tickets(rt, clock):
     assert [a["ref"] for a in rt2.auto_approved] == [out.extra["approval"]]
     assert frontmatter.parse(rt.memory.read("plans/2026-W45.md"))[0]["status"] == "auto_approved"
     assert rt2.approvals.get(spend["id"])["status"] == "pending"
-    assert rt2.scheduler.agent_limit("engineer") == 400       # approved split now live (40% of 1000)
+    assert rt2.scheduler.agent_limit("research") == 700       # approved split now live (70% of 1000)
     # approving the spend request only unblocks the ticket once its ticket dependency is done too
     rt2.approve(spend["ref"])
     assert rt2.tickets.get(t2.id).blocked_reason == f"{t1.id} is todo"
@@ -181,7 +181,7 @@ def test_rejecting_plan_cancels_its_tickets(rt):
 
 
 def test_plan_repairs_invalid_draft(rt):
-    bad = plan_json(spend=False, split={"research": 80, "ceo": 50})          # > 100%
+    bad = plan_json(spend=False, split={"research": 80, "ceo": 40, "reserve": 10})   # > 100%
     rt.llm.script = [bad, "not json", plan_json(spend=False)]
     out = rt.plan()
     assert out.status == "done"

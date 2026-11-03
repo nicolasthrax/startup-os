@@ -32,6 +32,7 @@ uv run startup-os search "invoices agencies"   # FTS5 search over company memory
 
 uv run startup-os pick research/ideas/<brief>.md   # pick the venture → stage Validation + validation ticket
 uv run startup-os validate        # Research: company/research/validation/<date>-<venture>.md
+uv run startup-os research [--ticket T-0002] [--limit N]   # Research: execute open research tickets
 uv run startup-os plan            # CEO: company/plans/<ISO-week>.md + tickets + approval
 uv run startup-os inbox [--all]   # pending approvals (and recent decisions)
 uv run startup-os approve A-3     # or: reject A-3 --reason "..."
@@ -56,18 +57,29 @@ ideas ──► pick ──► validate ──► plan ──► inbox / approve
   decision record in `company/decisions/` (what, why, alternatives) in the same commit as `venture.md`.
   Policy enforced in code: Validation → Build only with a validation report scoring at least
   `validation.go_threshold` (default 7); dropping a GO idea back to Ideation needs a human.
-- **pick** records an `idea_pick` approval (approved by you), moves the stage to Validation, and the
-  CEO writes a validation ticket for Research.
+- **pick** is yours alone: it needs an explicit brief path (`research/ideas/<file>.md`; no name
+  matching). It records an `idea_pick` approval (approved by you), moves the stage to Validation, and
+  the CEO writes a validation ticket for Research. Agents cannot create idea picks; the CEO can only
+  recommend one in its plan.
 - **validate** runs Research in validation mode: competitor teardown, pricing scan, demand signals,
-  kill-criteria check, go/no-go score and evidence links. Links the model cites but never saw in a
-  tool result are listed separately as unverified.
+  kill-criteria check, go/no-go breakdown and evidence links. The model scores weighted factors; the
+  system computes the weighted score exactly, shows it rounded half up, and decides GO only if the
+  **unrounded** score is at least the threshold (6.95 is NO-GO at 7). Links the model cites but never
+  saw in a tool result are listed separately as unverified.
+- **research** executes open `research` tickets of any kind, one scheduler task each, with the same
+  guards (`research_tickets` in `config.yaml`). Validation tickets run in validation mode; others
+  write a note to `company/research/notes/`. Blocked and `claude-code` tickets are not run.
+- **Paths:** every company file the CEO or Research references (ticket `inputs`, recommended picks,
+  a note's `related_files`) is checked against `company/`. An unknown path invalidates that item
+  (a ticket is dropped, along with tickets that depend on it) and is logged as `invalid_path`.
 - **plan** has the CEO read `venture.md`, the latest research (validation report, or the idea briefs
   in Ideation) and the last retro, then write `plans/<ISO-week>.md`: goals, tickets (owner `research`
   or `claude-code`), the proposed call-budget split, spend requests, and any stage change. Re-planning
   in the same week supersedes the earlier plan.
 - **Approvals** (`approvals` table in `data/state.db`; each decision also appended to `company/approvals.log`):
   - `plan_approval` auto-approves after 48h. Approval makes the plan's budget split live;
-    rejection cancels its tickets.
+    rejection cancels its tickets. A plan whose split names any agent other than `ceo`, `research`
+    and `reserve` is rejected (Claude Code has a separate subscription and no OpenRouter quota).
   - `spend_request` never auto-approves and never expires into approval. Tickets that depend on
     it stay blocked until you approve it. Approval only unblocks tickets; nothing is ever spent.
   - `idea_pick` is created by `pick`, or proposed by the CEO in Ideation.

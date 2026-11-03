@@ -69,6 +69,8 @@ class ApprovalQueue:
     def create(self, kind: str, title: str, payload: dict, *, requested_by: str) -> dict:
         if kind not in KINDS:
             raise ApprovalError(f"unknown approval kind {kind!r}")
+        if kind == "idea_pick" and requested_by != "human":
+            raise ApprovalError("idea picks are the human's: agents may only recommend")
         now = self.now()
         auto = AUTO_APPROVE_AFTER.get(kind)
         with self._conn() as c:

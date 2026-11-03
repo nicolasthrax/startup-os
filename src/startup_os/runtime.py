@@ -15,15 +15,17 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from . import frontmatter
 from .agents import ceo as ceo_agent
 from .agents.research import ResearchDeps, build_research_graph, recursion_limit
+from .agents.ticket_research import TicketResearchDeps, build_ticket_graph
 from .agents.validation import ValidationDeps, build_validation_graph
 from .approvals import ApprovalError, ApprovalQueue
 from .budget import BudgetExceeded, Scheduler
-from .config import Config
+from .config import BUDGET_AGENTS, Config, split_problem
 from .guards import LoopGuard
 from .llm import AllModelsFailed, CallFn, ModelRouter, openrouter_call_fn
 from .memory import MemoryRepo
 from .runlog import NullRunLog, RunLog
 from .search_index import SearchIndex
+from .paths import check_path
 from .spend import SpendGate
 from .tickets import OPEN, TicketStore
 from .tools import Toolbox, web_search
@@ -50,7 +52,7 @@ class TaskOutcome:
     extra: dict = field(default_factory=dict)
 
 
-TASK_AGENT = {"ideas": "research", "validate": "research", "plan": "ceo"}
+TASK_AGENT = {"ideas": "research", "validate": "research", "ticket": "research", "plan": "ceo"}
 
 
 class Runtime:
@@ -71,9 +73,10 @@ class Runtime:
         backends = cfg.web_search.backends
         self.web_search_fn = web_search_fn or (lambda q, n: web_search(q, n, backends))
         self.recovered = self.scheduler.recover_interrupted(stale_after_s=cfg.llm.timeout_s * 2)
-        self.auto_approved = self.approvals.process_due()
         self._log: RunLog = NullRunLog()
         self._last_pick: dict | None = None
+        self.invalid_plans = self._reject_invalid_plans()   # before any auto-approval
+        self.auto_approved = self.approvals.process_due()
 
     # ------------------------------------------------------------ plumbing --
     def call_fn(self) -> CallFn:
@@ -106,7 +109,7 @@ class Runtime:
             router=self.router(log), memory=self.memory, venture=self.venture, tickets=self.tickets,
             approvals=self.approvals, spend_gate=self.spend_gate, scheduler=self.scheduler,
             guard=LoopGuard(self.cfg.ceo.max_steps, g.max_identical_tool_calls),
-            go_threshold=self.cfg.validation.go_threshold, agents=sorted(self.cfg.budget.agents),
+            go_threshold=self.cfg.validation.go_threshold, agents=list(BUDGET_AGENTS),
             now=self.now, run_log=log)
 
     # --------------------------------------------------------------- tasks --
@@ -126,6 +129,13 @@ class Runtime:
                                   self.venture, self.tickets, v.go_threshold, log)
             return (build_validation_graph(deps, self._checkpointer()),
                     {"ticket_id": task["payload"]["ticket"], "run_id": log.run_id}, 2 * v.max_steps + 10)
+        if kind == "ticket":
+            rt_cfg = cfg.research_tickets
+            guard = LoopGuard(rt_cfg.max_steps, cfg.guards.max_identical_tool_calls, rt_cfg.max_tool_calls)
+            deps = TicketResearchDeps(self.router(log), self.memory, self.toolbox(log, "research"), guard,
+                                      self.tickets, log)
+            return (build_ticket_graph(deps, self._checkpointer()),
+                    {"ticket_id": task["payload"]["ticket"], "run_id": log.run_id}, 2 * rt_cfg.max_steps + 10)
         if kind == "plan":
             return (ceo_agent.build_plan_graph(self.ceo_deps(log), self._checkpointer()),
                     {"run_id": log.run_id}, cfg.ceo.max_steps + 10)
@@ -158,7 +168,8 @@ class Runtime:
             self._log = NullRunLog()
         self.scheduler.set_status(task["id"], "done")
         written = state.get("written") or [p for p in (state.get("report_path"), state.get("plan_path")) if p]
-        extra = {k: state.get(k) for k in ("approval", "notes", "report_path", "plan_path") if state.get(k)}
+        extra = {k: state.get(k) for k in ("approval", "notes", "report_path", "plan_path", "recommendation",
+                                          "ticket_id") if state.get(k)}
         log.close("done", written=written, **extra)
         return TaskOutcome(task["id"], "done", written, state.get("failed", []), None, log.run_id,
                            str(log.path), extra)
@@ -178,27 +189,14 @@ class Runtime:
         return self.run_task(self._new_task("ideas", {"n": n}))
 
     def resolve_brief(self, path: str) -> str:
-        """Accept company/research/ideas/x.md, research/ideas/x.md, x.md, x, or an absolute path."""
-        p = Path(path)
-        if p.is_absolute():
-            try:
-                p = p.resolve().relative_to(self.memory.root)
-            except ValueError:
-                raise CommandError(f"{path} is not inside {self.memory.root}") from None
-        cands = [p]
-        if p.parts and p.parts[0] == Path(self.cfg.paths.company).name:
-            cands.append(Path(*p.parts[1:]))
-        cands += [Path("research/ideas") / p.name, Path("research/ideas") / f"{p.name}.md"]
-        for c in cands:
-            try:
-                if c.suffix == ".md" and self.memory.exists(c):
-                    return str(c)
-            except Exception:  # noqa: BLE001 - path escapes repo
-                continue
-        matches = sorted((self.memory.root / "research/ideas").glob(f"*{p.stem}*.md"))
-        if len(matches) == 1:
-            return str(matches[0].relative_to(self.memory.root))
-        raise CommandError(f"no idea brief matches {path!r}")
+        """An explicit path to an existing idea brief, e.g. research/ideas/x.md or
+        company/research/ideas/x.md. No name matching or auto-selection."""
+        if not path or not str(path).strip():
+            raise CommandError("pick needs an explicit idea brief file")
+        rel, problem = check_path(self.memory, path, under="research/ideas", suffix=".md")
+        if problem:
+            raise CommandError(f"not an existing idea brief: {path} ({problem})")
+        return rel
 
     def pick(self, path: str, reason: str | None = None) -> dict:
         """Human picks an idea: recorded as an approved idea_pick, which moves the stage to Validation."""
@@ -247,6 +245,41 @@ class Runtime:
         self.call_fn()
         return self.run_task(self._new_task("validate", {"ticket": open_v[0].id, "venture": st.name}))
 
+    def research(self, ticket_id: str | None = None, limit: int | None = None) -> list[dict]:
+        """Execute open research tickets (any kind) in id order, one task each, under the
+        same scheduler and guards. Validation tickets run in validation mode and need the
+        Validation stage for their venture. Stops early if a task is deferred (budget)."""
+        if ticket_id:
+            todo = [self.tickets.get(ticket_id)]
+            if todo[0].owner != "research":
+                raise CommandError(f"{ticket_id} is owned by {todo[0].owner}, not research")
+            if todo[0].status != "todo":
+                raise CommandError(f"{ticket_id} is {todo[0].status}" +
+                                   (f" ({todo[0].blocked_reason})" if todo[0].blocked_reason else ""))
+        else:
+            todo = self.tickets.list(owner="research", status="todo")
+        if limit:
+            todo = todo[:limit]
+        if not todo:
+            return []
+        self.call_fn()
+        results = []
+        for t in todo:
+            if t.kind == "validation":
+                v = self.venture.load()
+                if v.stage != Stage.VALIDATION or t.venture != v.name:
+                    results.append({"ticket": t.id, "status": "skipped",
+                                    "reason": f"validation ticket for {t.venture}, but venture is "
+                                              f"{v.name or 'none'} in {v.stage.value}"})
+                    continue
+                out = self.run_task(self._new_task("validate", {"ticket": t.id, "venture": t.venture}))
+            else:
+                out = self.run_task(self._new_task("ticket", {"ticket": t.id}))
+            results.append({"ticket": t.id, "status": out.status, "outcome": out})
+            if out.status == "deferred":
+                break
+        return results
+
     def plan(self) -> TaskOutcome:
         self.call_fn()
         return self.run_task(self._new_task("plan", {"week": ceo_agent.iso_week(self.now())}))
@@ -258,10 +291,24 @@ class Runtime:
         return self.approvals.reject(aid, reason=reason, by="human")
 
     # ----------------------------------------------------- approval effects --
+    def _reject_invalid_plans(self) -> list[dict]:
+        """Pending plans whose budget split names agents outside ceo/research/reserve are rejected."""
+        out = []
+        for a in self.approvals.list(status="pending", kind="plan_approval"):
+            problem = split_problem(a["payload"].get("budget_split") or {})
+            if problem:
+                out.append(self.approvals.reject(a["id"], by="system",
+                                                 reason=f"invalid budget split: {problem}"))
+        return out
+
     def _on_decided(self, a: dict) -> None:
         """Apply the effects of a decision, then log it to company/approvals.log."""
         approved = a["status"] in ("approved", "auto_approved")
         kind, p = a["kind"], a["payload"]
+        if kind == "plan_approval" and approved:
+            problem = split_problem(p.get("budget_split") or {})
+            if problem:  # never let an invalid split go live; the approval reverts to pending
+                raise ApprovalError(f"cannot approve {a['ref']}: budget split {problem}")
         if kind == "plan_approval" and a["status"] != "superseded":
             self._set_plan_status(p, a)
             if approved:
@@ -275,7 +322,7 @@ class Runtime:
         elif kind == "spend_request":
             # Approval only unblocks dependent tickets; nothing is ever spent in this slice.
             self.tickets.refresh(self.approvals.status)
-        elif kind == "idea_pick" and approved:
+        elif kind == "idea_pick" and approved and a["requested_by"] == "human":
             self._last_pick = self._do_pick(p["brief"], p.get("why"), a)
         line = f"{a['ref']}\t{a['kind']}\t{a['status']}\tby={a['decided_by']}\t{a['title']}"
         if a.get("reason"):

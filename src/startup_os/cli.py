@@ -51,9 +51,27 @@ def cmd_validate(args, rt: Runtime) -> int:
     if o.status == "done":
         from . import frontmatter
         meta, _ = frontmatter.parse(rt.memory.read(o.extra["report_path"]))
-        print(f"  go/no-go: {meta['go_score']}/10 (threshold {meta['go_threshold']}) → {meta['recommendation']}")
+        print(f"  go/no-go: weighted {meta['go_weighted']:g}/10 (shown as {meta['go_score']}; threshold "
+              f"{meta['go_threshold']}) → {meta['recommendation']}")
         print("  next: startup-os plan")
     return 0 if o.status == "done" else 2
+
+
+def cmd_research(args, rt: Runtime) -> int:
+    results = rt.research(args.ticket, args.limit)
+    if not results:
+        print("no open research tickets")
+        return 0
+    rc = 0
+    for r in results:
+        if r["status"] == "skipped":
+            print(f"{r['ticket']}: skipped — {r['reason']}")
+            continue
+        o = r["outcome"]
+        print(f"{r['ticket']}:", end="")
+        _print_outcome(o, rt)
+        rc = rc or (0 if o.status == "done" else 2)
+    return rc
 
 
 def cmd_plan(args, rt: Runtime) -> int:
@@ -223,6 +241,10 @@ def main(argv: list[str] | None = None) -> int:
     s.set_defaults(fn=cmd_pick)
     sub.add_parser("validate", help="Research agent: validation report for the picked idea").set_defaults(fn=cmd_validate)
     sub.add_parser("plan", help="CEO agent: write this week's plan").set_defaults(fn=cmd_plan)
+    s = sub.add_parser("research", help="Research agent: execute open research tickets (any type)")
+    s.add_argument("--ticket", default=None, help="run only this ticket, e.g. T-0002")
+    s.add_argument("--limit", type=int, default=None, help="run at most N tickets")
+    s.set_defaults(fn=cmd_research)
     s = sub.add_parser("inbox", help="pending approvals")
     s.add_argument("--all", action="store_true", help="also show recent decisions")
     s.set_defaults(fn=cmd_inbox)
@@ -243,6 +265,8 @@ def main(argv: list[str] | None = None) -> int:
         p.error("--n must be >= 1")
     try:
         rt = Runtime(load_config(args.config))
+        for a in rt.invalid_plans:
+            print(f"note: rejected {a['ref']} ({a['title']}): {a['reason']}")
         if rt.auto_approved and args.cmd != "inbox":
             print("note: auto-approved " + ", ".join(a["ref"] for a in rt.auto_approved) + " (48h passed)")
         if rt.recovered:

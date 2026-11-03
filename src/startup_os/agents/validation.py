@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from decimal import ROUND_HALF_UP, Decimal
 from datetime import datetime, timezone
 from typing import Literal
 
@@ -76,16 +77,47 @@ class KillCheck(BaseModel):
         return {"met": "pass", "passed": "pass", "failed": "fail", "not met": "fail"}.get(v, v)
 
 
+class Factor(BaseModel):
+    factor: str
+    weight: float = Field(gt=0)        # any scale; normalised by the sum of weights
+    score: float = Field(ge=1, le=10)
+    reasoning: str = ""
+
+    @field_validator("weight", "score", mode="before")
+    @classmethod
+    def _num(cls, v):
+        if isinstance(v, str):
+            m = re.match(r"^\s*(\d+(?:\.\d+)?)", v)
+            return float(m.group(1)) if m else v
+        return v
+
+
+def weighted_score(breakdown: list["Factor"]) -> Decimal:
+    """Exact weighted mean of factor scores (Decimal, so 4.55 stays 4.55)."""
+    total_w = sum(Decimal(str(f.weight)) for f in breakdown)
+    return sum(Decimal(str(f.weight)) * Decimal(str(f.score)) for f in breakdown) / total_w
+
+
+def round_half_up(x: Decimal | float) -> int:
+    return int(Decimal(str(x)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+def is_go(weighted: Decimal | float, threshold: float) -> bool:
+    """The decision uses the unrounded weighted score: 6.95 is NO-GO at threshold 7."""
+    return Decimal(str(weighted)) >= Decimal(str(threshold))
+
+
 class GoNoGo(BaseModel):
-    score: int = Field(ge=1, le=10)
+    breakdown: list[Factor] = Field(min_length=1)
     reasoning: str
 
-    @field_validator("score", mode="before")
-    @classmethod
-    def _coerce(cls, v):
-        if isinstance(v, str) and re.match(r"^\s*\d+", v):
-            return int(re.match(r"^\s*(\d+)", v).group(1))
-        return round(v) if isinstance(v, float) else v
+    @property
+    def weighted(self) -> Decimal:
+        return weighted_score(self.breakdown)
+
+    @property
+    def score(self) -> int:
+        return round_half_up(self.weighted)
 
 
 class ValidationReport(BaseModel):
@@ -106,7 +138,9 @@ REPORT_SCHEMA = """{
   "demand_signals": [{"signal": "concrete observation", "strength": "weak|moderate|strong", "source": "url"}],
   "kill_criteria_check": [{"criterion": "from the brief", "status": "pass|fail|unknown", "evidence": "..."}],
   "risks": ["..."],
-  "go_no_go": {"score": 1-10 integer, "reasoning": "why"},
+  "go_no_go": {"breakdown": [{"factor": "pain & budget", "weight": 30, "score": 1-10, "reasoning": "..."},
+                             {"factor": "differentiation", "weight": 25, "score": 1-10, "reasoning": "..."}],
+               "reasoning": "overall verdict"},
   "evidence_links": ["urls you actually saw in tool results"]
 }"""
 
@@ -146,24 +180,28 @@ Rules:
 - Spend searches on: named competitors and their pricing pages, reviews/complaints, and demand evidence
   (forums, job posts, search interest). Never repeat an identical query.
 - Only list URLs in evidence_links / source fields that appeared in tool results.
-- Go/no-go score: 1 = clearly do not build, 10 = overwhelming evidence. We build only at >= {threshold}.
-  Most ideas should land 4-7. Unknown is not evidence of demand."""
+- Go/no-go: score each factor 1-10 (1 = clearly do not build, 10 = overwhelming evidence) with a weight.
+  Do NOT compute the total: the system computes the weighted score and builds only if it is >= {threshold}
+  (unrounded). Most ideas should land 4-7. Unknown is not evidence of demand."""
 
 
 def render_report(rep: ValidationReport, *, venture: str, idea: str | None, ticket: str, run_id: str,
                   models: list[str], retrieved: list[str], threshold: int) -> str:
     now = datetime.now(timezone.utc)
-    go = rep.go_no_go.score >= threshold
+    weighted = rep.go_no_go.weighted
+    go = is_go(weighted, threshold)
+    w_str = f"{weighted.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP).normalize():f}"
     retrieved_set = list(dict.fromkeys(retrieved))
     cited_only = [u for u in dict.fromkeys(rep.evidence_links) if u not in retrieved_set]
     meta = {"title": f"Validation: {venture}", "venture": venture, "idea": idea, "ticket": ticket,
             "date": now.date().isoformat(), "agent": AGENT, "run_id": run_id,
-            "models": sorted(set(models)), "go_score": rep.go_no_go.score, "go_threshold": threshold,
+            "models": sorted(set(models)), "go_score": rep.go_no_go.score, "go_weighted": float(weighted),
+            "go_threshold": threshold,
             "recommendation": "GO" if go else "NO-GO",
             "evidence": "web" if retrieved_set else "reasoning-only"}
     L = [f"# Validation report: {venture}", "",
-         f"**Recommendation: {'GO' if go else 'NO-GO'}** — score {rep.go_no_go.score}/10 "
-         f"(go threshold {threshold})", "", rep.summary, ""]
+         f"**Recommendation: {'GO' if go else 'NO-GO'}** — weighted score {w_str}/10 "
+         f"(shown as {rep.go_no_go.score}/10; go needs >= {threshold} unrounded)", "", rep.summary, ""]
     if not retrieved_set:
         L += ["> ⚠️ **Reasoning only** — no web evidence was retrieved; treat every claim as unverified.", ""]
     L += ["## Competitor teardown", "", "| Competitor | Pricing | Strengths | Weaknesses |", "|---|---|---|---|"]
@@ -181,7 +219,12 @@ def render_report(rep: ValidationReport, *, venture: str, idea: str | None, tick
         L += [f"| {k.criterion} | {k.status} | {k.evidence} |" for k in rep.kill_criteria_check]
     if rep.risks:
         L += ["", "## Risks", ""] + [f"- {r}" for r in rep.risks]
-    L += ["", f"## Go / no-go: {rep.go_no_go.score}/10 → {'GO' if go else 'NO-GO'}", "",
+    L += ["", f"## Go / no-go: {w_str}/10 → {'GO' if go else 'NO-GO'}", "",
+          "| Factor | Weight | Score | Reasoning |", "|---|---|---|---|"]
+    total_w = sum(f.weight for f in rep.go_no_go.breakdown)
+    L += [f"| {f.factor} | {f.weight / total_w:.0%} | {f.score:g} | {f.reasoning} |" for f in rep.go_no_go.breakdown]
+    L += ["", f"Weighted score {w_str} (computed by the system; rounded half up to {rep.go_no_go.score}). "
+          f"Decision compares the unrounded score to the threshold {threshold}.", "",
           rep.go_no_go.reasoning, "", "## Evidence links", ""]
     L += [f"- {u}" for u in retrieved_set] or ["- _none retrieved_"]
     if cited_only:
@@ -230,7 +273,7 @@ def build_validation_graph(deps: ValidationDeps, checkpointer=None):
                                 retrieved=state["sources"], threshold=deps.go_threshold)
         date = datetime.now(timezone.utc).date().isoformat()
         rel = deps.memory.unique_path(f"{VALIDATION_DIR}/{date}-{slugify(v.name or 'venture')}.md")
-        go = rep.go_no_go.score >= deps.go_threshold
+        go = is_go(rep.go_no_go.weighted, deps.go_threshold)
         done = ticket.model_copy(update={
             "status": "done", "blocked_reason": None,
             "result": f"Report: [{rel}](../{rel}) — {rep.go_no_go.score}/10, {'GO' if go else 'NO-GO'}"})

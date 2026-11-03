@@ -25,13 +25,36 @@ class LLMConfig(BaseModel):
     defer_hours_on_failure: float = 1
 
 
+# Agents that draw on the OpenRouter call budget. Claude Code runs on a separate
+# subscription and must never take OpenRouter quota, so it is deliberately absent.
+BUDGET_AGENTS = ("ceo", "research", "reserve")
+
+
+def split_problem(split: dict[str, float]) -> str | None:
+    """Why a budget split is invalid, or None. It must name exactly BUDGET_AGENTS."""
+    extra = sorted(set(split) - set(BUDGET_AGENTS))
+    missing = sorted(set(BUDGET_AGENTS) - set(split))
+    if extra:
+        return f"names agents outside the budget: {extra} (allowed: {list(BUDGET_AGENTS)})"
+    if missing:
+        return f"is missing agents {missing} (must name exactly {list(BUDGET_AGENTS)})"
+    if any(v < 0 for v in split.values()):
+        return "has negative percentages"
+    if sum(split.values()) > 100 + 1e-9:
+        return f"sums to {sum(split.values()):g}% (> 100)"
+    return None
+
+
 class BudgetConfig(BaseModel):
     daily_requests: int = 1000
     per_minute: int = 20
-    agents: dict[str, float] = Field(default_factory=lambda: {"research": 100})
+    agents: dict[str, float] = Field(default_factory=lambda: {"research": 65, "ceo": 25, "reserve": 10})
 
     @model_validator(mode="after")
     def _shares_sum(self) -> "BudgetConfig":
+        problem = split_problem(self.agents)
+        if problem:
+            raise ValueError(f"budget.agents {problem}")
         total = sum(self.agents.values())
         if total > 100 + 1e-9:
             raise ValueError(f"budget.agents percentages sum to {total} (> 100)")
@@ -60,6 +83,11 @@ class ValidationConfig(BaseModel):
     max_tool_calls: int = 8
 
 
+class ResearchTicketsConfig(BaseModel):
+    max_steps: int = 12          # LLM steps per research ticket
+    max_tool_calls: int = 6      # tool calls per research ticket
+
+
 class CEOConfig(BaseModel):
     max_steps: int = 3          # draft attempts (initial + repairs) per plan
 
@@ -73,6 +101,7 @@ class Config(BaseModel):
     web_search: WebSearchConfig = WebSearchConfig()
     validation: ValidationConfig = ValidationConfig()
     ceo: CEOConfig = CEOConfig()
+    research_tickets: ResearchTicketsConfig = ResearchTicketsConfig()
 
     @property
     def company_dir(self) -> Path:

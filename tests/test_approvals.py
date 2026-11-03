@@ -32,7 +32,7 @@ def test_spend_requests_never_auto_approve(q, clock):
 
 
 def test_idea_picks_never_auto_approve(q, clock):
-    i = q.create("idea_pick", "Pick X", {"brief": "x.md"}, requested_by="ceo")
+    i = q.create("idea_pick", "Pick X", {"brief": "x.md"}, requested_by="human")
     clock.advance(100 * 24 * 3600)
     q.process_due()
     assert q.get(i["id"])["status"] == "pending"
