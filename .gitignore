@@ -1,0 +1,10 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+# runtime state: memory repo is its own Git repo; data and logs stay local
+company/
+data/
+logs/
+ventures/

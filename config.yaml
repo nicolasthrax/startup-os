@@ -1,0 +1,88 @@
+# Startup OS configuration. Paths are relative to this file.
+
+paths:
+  company: company        # memory repo (its own Git repo, created on first run)
+  data: data              # SQLite: usage/queue, search index, LangGraph checkpoints
+  logs: logs              # structured JSONL run logs
+
+company:
+  # Private Git remote for company/, so it survives fresh sessions. Pulled at the start of every
+  # command, pushed after every commit, never force-pushed. Token comes from the env var below
+  # (never put it in the URL, config or .env committed anywhere). Unset → local-only, with a warning.
+  remote: https://github.com/nicolasthrax/startup-os-company.git
+  token_env: COMPANY_REPO_TOKEN
+
+llm:
+  base_url: https://openrouter.ai/api/v1
+  api_key_env: OPENROUTER_API_KEY
+  timeout_s: 90
+  temperature: 0.7
+  max_tokens: 6000        # reasoning models spend tokens before answering
+  # Tried in order. On a 429 or any error the next model is tried; if all fail
+  # the task is deferred by `defer_hours_on_failure`. Only ":free" models, so
+  # nothing here spends money. Run `uv run startup-os models` to list the
+  # free models OpenRouter currently offers and update this list.
+  # Ranked 2026-11-03 by public benchmarks plus a live probe on a brief task.
+  # Not usable: thinkingmachines/inkling(-small):free (403, restricted to listed apps).
+  models:
+    - nvidia/nemotron-3-ultra-550b-a55b:free   # 550B/55B active MoE; top open US model on AA index
+    - dots-studio/dots-3-note-preview:free     # 280B/16B active; strong reasoning (ARC-AGI-2)
+    - nvidia/nemotron-3.5-super-vl:free        # 120B/12B active; fastest valid brief in probe
+    - google/gemma-4-31b-it:free               # dense 31B; fallback
+    - google/gemma-4-26b-a4b-it:free           # small MoE; last resort
+  defer_hours_on_failure: 1
+
+budget:
+  daily_requests: 1000    # every LLM request attempt (including fallbacks) counts
+  per_minute: 20          # token-bucket rate limit
+  # Share of the daily quota per agent, in percent (must sum to <= 100).
+  # Exactly these three agents. Claude Code uses a separate subscription and
+  # never draws on OpenRouter quota, so it has no share here.
+  agents:
+    research: 65
+    ceo: 25
+    reserve: 10
+
+guards:
+  max_steps_per_task: 8          # LLM steps per idea brief before forcing a final answer
+  max_identical_tool_calls: 2    # the 2nd identical call (same tool + args) stops the loop
+  max_tool_calls_per_task: 4     # tool calls per brief; after that the agent must finalise
+
+web_search:
+  enabled: true
+  provider: ddgs          # free metasearch, no API key
+  backends: [duckduckgo, google, brave, bing, mojeek]   # tried in order until one returns results
+  max_results: 5
+
+validation:
+  go_threshold: 7         # go/no-go score (1-10) needed to move Validation → Build
+  max_steps: 14           # LLM steps for one validation report
+  max_tool_calls: 8       # web searches etc. for one validation report
+
+research_tickets:         # `startup-os research`: any open research ticket (non-validation)
+  max_steps: 12
+  max_tool_calls: 6
+
+ceo:
+  max_steps: 3            # plan draft attempts (first try + repairs)
+
+# ---- Claude Code executor (`startup-os build`) --------------------------------
+# Claude Code runs on its own subscription; these limits are separate from the
+# OpenRouter budget above.
+claude_code:
+  command: claude
+  sessions_per_day: 3       # headless sessions per UTC day, tracked in data/state.db
+  ticket_timeout_min: 30    # one Claude Code session per ticket attempt
+  max_turns: 60
+  permission_mode: acceptEdits
+
+ship:
+  ventures_dir: ventures    # each venture is its own Git repo (git-ignored here)
+  max_attempts: 2           # two failed attempts → ticket status needs_rescope (back to the CEO)
+  step_timeout_min: 15
+  vercel_cli: vercel@64.7.0
+  supabase_cli: supabase@2.121.0
+  health_minutes: 10        # watch prod /api/health after the prod deploy
+  health_interval_s: 30
+  health_failures_before_rollback: 3   # consecutive failed checks before an automatic rollback
+  max_smoke_checks: 3
