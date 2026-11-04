@@ -598,3 +598,161 @@ def test_vercel_prod_deploy_uses_deploy_prod_not_promote(tmp_path):
     assert seen["cmd"][-3:] == ["deploy", "--prod", "--yes"] and "promote" not in seen["cmd"]
     assert seen["env"]["VERCEL_TOKEN"] == "vercel-secret-token-123"
     assert not hasattr(v, "promote")
+
+
+# ------------------------------------------------------------------ auth/config errors are not strikes
+class ConfigFailVercel(FakeVercel):
+    def __init__(self, calls, on):
+        super().__init__(calls)
+        self.on = on
+
+    def _maybe(self, name):
+        from startup_os.ship.providers import ConfigError
+        self.calls.append((f"vercel {name}", None))
+        if name == self.on:
+            raise ConfigError(f"vercel {name}: auth/config error (Project not found), not a code failure")
+
+
+@pytest.mark.parametrize("on,step", [("deploy", "d) preview deploy"), ("deploy --prod", "g) prod deploy")])
+def test_vercel_config_errors_block_without_a_strike(cfg_path, clock, on, step):
+    rt = make_rt(cfg_path, clock, vercel=ConfigFailVercel(None, on))
+    tid = hello_ticket(rt)
+    [o] = rt.build()
+    assert o.status == "blocked_config" and "Project not found" in o.reason
+    assert steps(o)[-1] == (step, "fail")
+    t = rt.tickets.get(tid)
+    assert t.attempts == 0 and t.status == "todo" and t.built_commit     # no strike; commit kept for reuse
+    assert "health" not in rt.calls.names()
+    # the fixed config reruns without a new Claude Code session
+    rt.fakes["vercel"].on = None
+    [o2] = rt.build()
+    assert o2.status == "shipped" and steps(o2)[0] == ("Claude Code", "skip")
+
+
+@pytest.mark.parametrize("out,config", [
+    ('Error: Project not found ({"VERCEL_PROJECT_ID":"prj_x","VERCEL_ORG_ID":"y"})', True),
+    ("Error: The specified token is not valid. Use `vercel login` to generate a new token.", True),
+    ("Error: Request failed with status 403 Forbidden", True),
+    ("Error: 401 Unauthorized", True),
+    ("Error: You do not have access to the specified account", True),
+    ("Error: You specified VERCEL_ORG_ID but you forgot to specify VERCEL_PROJECT_ID", True),
+    ("Error: Command \"npm run build\" exited with 1", False),               # a code failure: still a strike
+    ("Error: this feature requires a Pro plan (402)", "paid"),
+])
+def test_vercel_cli_error_classification(tmp_path, out, config):
+    from startup_os.ship.providers import ConfigError, Vercel
+    from startup_os.ship.secrets import VentureSecrets
+    v = Vercel("vercel@64.7.0", VentureSecrets.from_env("hello", SECRETS), tmp_path, 60,
+               shell=lambda cmd, **kw: CmdResult(1, "", out, 0.1))
+    for call in (v.deploy_preview, v.deploy_prod):
+        exc = PaidPlanRequired if config == "paid" else (ConfigError if config else StepFailed)
+        with pytest.raises(exc) as e:
+            call()
+        assert type(e.value) is exc
+        if config is True:
+            assert "VERCEL_ORG_ID" in str(e.value) and "vercel-secret-token-123" not in str(e.value)
+
+
+@pytest.mark.parametrize("code", [401, 403, 404])
+def test_vercel_env_api_auth_errors_are_config_errors(tmp_path, monkeypatch, code):
+    import io
+    import urllib.error
+    from startup_os.ship.providers import ConfigError, Vercel
+    from startup_os.ship.secrets import VentureSecrets
+    def urlopen(req, timeout):
+        raise urllib.error.HTTPError(req.full_url, code, "x", {}, io.BytesIO(b'{"error":{"code":"forbidden"}}'))
+    monkeypatch.setattr("urllib.request.urlopen", urlopen)
+    v = Vercel("vercel@64.7.0", VentureSecrets.from_env("hello", SECRETS), tmp_path, 60)
+    with pytest.raises(ConfigError, match=f"HTTP {code}"):
+        v.sync_env("preview", {"NEXT_PUBLIC_SUPABASE_URL": "https://s.supabase.co"})
+
+
+@pytest.mark.parametrize("out,config", [
+    ('FATAL: password authentication failed for user "postgres"', True),
+    ("Error: Tenant or user not found", True),
+    ('ERROR: syntax error at or near "tabel"', False),
+])
+def test_supabase_auth_errors_are_config_errors(tmp_path, out, config):
+    from startup_os.ship.providers import ConfigError, Supabase
+    from startup_os.ship.secrets import VentureSecrets
+    s = Supabase("supabase@2.121.0", VentureSecrets.from_env("hello", SECRETS), tmp_path, 60,
+                 shell=lambda cmd, **kw: CmdResult(1, "", out, 0.1))
+    with pytest.raises(ConfigError if config else StepFailed) as e:
+        s.push("staging")
+    assert (type(e.value) is ConfigError) == config and "pw-staging" not in str(e.value)
+
+
+# ------------------------------------------------------------------ venture project creation
+def _api(monkeypatch, project, user_id="user_me"):
+    import io
+    seen = {"urls": []}
+    class Resp(io.BytesIO):
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+    def urlopen(req, timeout):
+        seen.update(url=req.full_url, auth=req.headers.get("Authorization"))
+        seen["urls"].append(req.full_url)
+        body = {"user": {"id": user_id}} if "/v2/user" in req.full_url else project
+        return Resp(json.dumps(body).encode())
+    monkeypatch.setattr("urllib.request.urlopen", urlopen)
+    return seen
+
+
+def test_create_project_has_no_git_link_and_keeps_token_off_argv(tmp_path, monkeypatch):
+    from startup_os.ship.providers import Vercel
+    from startup_os.ship.secrets import VentureSecrets
+    api = _api(monkeypatch, {"id": "prj_new123", "name": "startup-os-hello"})
+    seen = {}
+    def shell(cmd, *, cwd, env, timeout_s, stdout_path=None):
+        seen.update(cmd=cmd, env=env)
+        return CmdResult(0, "Success! Project startup-os-hello added", "", 0.1)
+    v = Vercel("vercel@64.7.0", VentureSecrets.from_env("hello", SECRETS), tmp_path, 60, shell=shell)
+    assert v.create_project("startup-os-hello") == {"id": "prj_new123", "name": "startup-os-hello", "git": None}
+    assert seen["cmd"][-5:] == ["project", "add", "startup-os-hello", "--scope", "team_abc"]
+    assert "vercel-secret-token-123" not in " ".join(seen["cmd"]) and "git" not in seen["cmd"]
+    assert seen["env"]["VERCEL_TOKEN"] == "vercel-secret-token-123"
+    assert "VERCEL_PROJECT_ID" not in seen["env"] and "VERCEL_ORG_ID" not in seen["env"]
+    assert api["url"].endswith("/v9/projects/startup-os-hello?teamId=team_abc")
+
+
+def test_create_project_refuses_a_git_connected_project(tmp_path, monkeypatch):
+    from startup_os.ship.providers import Vercel
+    from startup_os.ship.secrets import VentureSecrets
+    _api(monkeypatch, {"id": "prj_new123", "name": "startup-os-hello",
+                       "link": {"type": "github", "org": "nicolasthrax", "repo": "startup-os"}})
+    v = Vercel("vercel@64.7.0", VentureSecrets.from_env("hello", SECRETS), tmp_path, 60,
+               shell=lambda cmd, **kw: CmdResult(0, "added", "", 0.1))
+    with pytest.raises(StepFailed, match="connected to Git"):
+        v.create_project("startup-os-hello")
+
+
+def test_vercel_project_command_prints_id_and_stores_nothing(cfg_path, monkeypatch, capsys):
+    from startup_os import cli
+    from startup_os.ship import providers
+    monkeypatch.setattr(providers.Vercel, "create_project",
+                        lambda self, name: {"id": "prj_new123", "name": name, "git": None})
+    for k, v in SECRETS.items():
+        monkeypatch.setenv(k, v)
+    assert cli.main(["--config", str(cfg_path), "vercel-project", "--venture", "hello",
+                     "--name", "startup-os-hello"]) == 0
+    out = capsys.readouterr().out
+    assert "project id: prj_new123" in out and "VENTURE_HELLO_VERCEL_PROJECT_ID is set to a different project" in out
+    assert not any(b"prj_new123" in f.read_bytes() for f in cfg_path.parent.rglob("*") if f.is_file())
+
+
+@pytest.mark.parametrize("uid,ok", [("8l7yPersonal", True), ("someone_else", False)])
+def test_create_project_in_a_personal_account(tmp_path, monkeypatch, uid, ok):
+    from startup_os.ship.providers import ConfigError, Vercel
+    from startup_os.ship.secrets import VentureSecrets
+    api = _api(monkeypatch, {"id": "prj_new123", "name": "startup-os-hello", "accountId": "8l7yPersonal"}, uid)
+    calls = []
+    v = Vercel("vercel@64.7.0", VentureSecrets.from_env("hello", {**SECRETS, "VENTURE_HELLO_VERCEL_ORG_ID": "8l7yPersonal"}),
+               tmp_path, 60, shell=lambda cmd, **kw: (calls.append(cmd) or CmdResult(0, "added", "", 0.1)))
+    if ok:
+        assert v.create_project("startup-os-hello")["id"] == "prj_new123"
+        assert "--scope" not in calls[0]                               # --scope takes teams only
+        assert "teamId" not in api["url"]
+    else:
+        with pytest.raises(ConfigError, match="not the token's own user"):
+            v.create_project("startup-os-hello")
+        assert calls == []                                              # nothing created

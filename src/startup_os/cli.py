@@ -10,6 +10,8 @@ from datetime import datetime
 
 from .approvals import ApprovalError
 from .runtime import CommandError, MissingAPIKey, Runtime, TaskOutcome
+from .ship.providers import StepFailed
+from .ship.secrets import MissingCredential
 from .sync import SyncError
 from .tickets import TicketError
 from .venture import TransitionError
@@ -102,6 +104,24 @@ def cmd_ticket_add(args, rt: Runtime) -> int:
     tid = rt.add_ticket(title=args.title, owner=args.owner, venture=args.venture, criteria=args.criterion,
                         description=args.description or "", depends_on=args.depends_on or [])
     print(f"created {tid}")
+    return 0
+
+
+def cmd_vercel_project(args, rt: Runtime) -> int:
+    """Create a venture's Vercel project (no Git connection). Prints the id; stores nothing."""
+    import os
+    from .ship.providers import Vercel
+    from .ship.secrets import VentureSecrets, env_prefix
+    secrets = VentureSecrets.from_env(args.venture, os.environ)
+    v = Vercel(rt.cfg.ship.vercel_cli, secrets, rt.cfg.root, rt.cfg.ship.step_timeout_min * 60)
+    p = v.create_project(args.name)
+    print(f"created Vercel project {p['name']} (no Git connection)")
+    print(f"  project id: {p['id']}")
+    current = secrets.values.get("VERCEL_PROJECT_ID")
+    var = env_prefix(args.venture) + "VERCEL_PROJECT_ID"
+    if current != p["id"]:
+        print(f"  {var} is {'unset' if not current else 'set to a different project'}; "
+              f"set it to {p['id']} (not stored by Startup OS)")
     return 0
 
 
@@ -306,6 +326,10 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--ticket", default=None)
     s.add_argument("--dry-run", action="store_true", help="stop after the preview deploy + smoke test")
     s.set_defaults(fn=cmd_build)
+    s = sub.add_parser("vercel-project", help="create a venture's Vercel project (no Git connection); prints its id")
+    s.add_argument("--venture", required=True)
+    s.add_argument("--name", required=True)
+    s.set_defaults(fn=cmd_vercel_project)
     sub.add_parser("sync", help="pull and push company/ to the private remote (company.remote)").set_defaults(fn=cmd_sync)
     s = sub.add_parser("ticket-add", help="create a ticket by hand")
     s.add_argument("--title", required=True)
@@ -328,7 +352,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"note: requeued {len(rt.recovered)} interrupted task(s) "
                   f"({', '.join(rt.recovered)}); run `startup-os run-due` to resume them.")
         return args.fn(args, rt)
-    except (MissingAPIKey, CommandError, ApprovalError, TransitionError, TicketError, SyncError) as e:
+    except (MissingAPIKey, CommandError, ApprovalError, TransitionError, TicketError, SyncError, MissingCredential, StepFailed) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
 

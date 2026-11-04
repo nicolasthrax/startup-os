@@ -153,7 +153,9 @@ build reuses it without a new Claude Code session.
 **Limits.** `claude_code.sessions_per_day` (default 3) is counted in SQLite (`claude_sessions`),
 separate from the OpenRouter budget. Each session has `ticket_timeout_min`; each step has
 `step_timeout_min`. A ticket that fails twice gets status `needs_rescope` with a failure summary,
-and the CEO sees it in its next plan. A cap or a missing credential is not a strike.
+and the CEO sees it in its next plan. A cap, a missing credential, or an auth/config error from Vercel
+or Supabase ("Project not found", 401/403, invalid token, wrong team/scope, failed DB password) is not a
+strike: the run stops as `blocked_config` with a hint about which `VENTURE_<SLUG>_*` value to check.
 
 **Money.** Claude Code may not add paid things; if a ticket truly needs one it declares it in
 `ship.json` (`paid_requirements`). That, or a Vercel/Supabase error that asks for a paid plan
