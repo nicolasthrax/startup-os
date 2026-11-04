@@ -25,7 +25,8 @@ SECRETS = {"VENTURE_HELLO_VERCEL_TOKEN": "vercel-secret-token-123", "VENTURE_HEL
            "VENTURE_HELLO_SUPABASE_PROD_ANON_KEY": "anon-prod-key",
            "OPENROUTER_API_KEY": "sk-or-v1-should-not-leak", "PATH": "/usr/bin"}
 ORDER = ["Claude Code", "a) build", "b) tests", "c) staging migrations", "d) preview deploy", "e) smoke test",
-         "f) prod migrations", "g) promote to prod", "h) prod health watch"]
+         "f) prod migrations", "g) prod deploy", "h) prod smoke test", "i) prod health watch"]
+PREVIEW, PROD = "https://hello-abc123.vercel.app", "https://hello.vercel.app"
 
 
 class Calls(list):
@@ -93,9 +94,9 @@ class FakeVercel:
         self._maybe("deploy")
         return "https://hello-abc123.vercel.app"
 
-    def promote(self, url):
-        self._maybe("promote")
-        return "https://hello.vercel.app"
+    def deploy_prod(self):
+        self._maybe("deploy --prod")
+        return "https://hello-prod789.vercel.app"
 
     def sync_env(self, target, values):
         self.calls.append((f"vercel env {target}", dict(values)))
@@ -120,7 +121,7 @@ class FakeSupabase:
 
 
 def make_rt(cfg_path, clock, *, claude=None, shell_fail=(), vercel=None, supabase_fail=None, smoke_ok=True,
-            health_seq=None, cap=3, environ=None):
+            prod_smoke_ok=True, health_seq=None, cap=3, environ=None):
     calls = Calls()
     health_seq = list(health_seq or [])
     import yaml
@@ -133,8 +134,7 @@ def make_rt(cfg_path, clock, *, claude=None, shell_fail=(), vercel=None, supabas
         shell=FakeShell(calls, shell_fail),
         vercel=vercel or FakeVercel(calls),
         supabase=FakeSupabase(calls, supabase_fail),
-        smoke=lambda url, checks, bypass: (calls.append(("smoke", url)) or
-                                           SmokeResult(smoke_ok, [{"check": "GET /api/health", "ok": smoke_ok}])),
+        smoke=lambda url, checks, bypass: _smoke(calls, url, checks, smoke_ok if url == PREVIEW else prod_smoke_ok),
         health=lambda url, bypass: (calls.append(("health", url)) or
                                     (health_seq.pop(0) if health_seq else (True, "ok"))),
         sleep=lambda s: calls.append(("sleep", s)),
@@ -147,6 +147,12 @@ def make_rt(cfg_path, clock, *, claude=None, shell_fail=(), vercel=None, supabas
     rt = Runtime(load_config(cfg_path), now=clock.now, ship_overrides=fakes)
     rt.calls, rt.fakes = calls, fakes
     return rt
+
+
+def _smoke(calls, url, checks, ok):
+    calls.append(("smoke", url))
+    calls.smoke_checks = getattr(calls, "smoke_checks", []) + [(url, [(c.path, c.expect_text) for c in checks])]
+    return SmokeResult(ok, [{"check": "GET /api/health", "ok": ok}])
 
 
 def hello_ticket(rt, **kw):
@@ -167,9 +173,19 @@ def test_full_ship_runs_every_gate_in_order(cfg_path, clock):
     assert o.status == "shipped"
     assert steps(o) == [(s, "pass") for s in ORDER]
     names = [n for n in rt.calls.names() if n != "sleep"]
-    assert names[:11] == ["claude", "npm install", "npm build", "npm test", "supabase staging", "vercel env preview",
-                          "vercel deploy", "smoke", "supabase prod", "vercel env production", "vercel promote"]
+    assert names[:12] == ["claude", "npm install", "npm build", "npm test", "supabase staging", "vercel env preview",
+                          "vercel deploy", "smoke", "supabase prod", "vercel env production", "vercel deploy --prod",
+                          "smoke"]
+    assert "vercel promote" not in names                            # prod is a fresh build, never a promoted preview
     assert names.count("health") == 4                               # 2 min / 30 s
+    assert [c for c in rt.calls if c[0] in ("smoke", "health")][:3] == [("smoke", PREVIEW), ("smoke", PROD),
+                                                                         ("health", PROD)]
+    # the prod smoke test runs the same Playwright checks as the preview one
+    (u1, c1), (u2, c2) = rt.calls.smoke_checks
+    assert (u1, u2) == (PREVIEW, PROD) and c1 == c2 == [("/", "Hello, world")]
+    g = next(x for x in o.steps if x["step"] == "g) prod deploy")
+    assert "https://hello-prod789.vercel.app" in g["detail"] and g["url"] == PROD
+    assert rt.tickets.get(tid).built_commit[:10] in g["detail"]     # same commit as the preview
     envs = {c[0]: c[1] for c in rt.calls if c[0].startswith("vercel env")}
     assert envs["vercel env preview"]["NEXT_PUBLIC_SUPABASE_URL"] == "https://staging.supabase.co"   # preview → staging
     assert envs["vercel env production"]["NEXT_PUBLIC_SUPABASE_URL"] == "https://prod.supabase.co"
@@ -185,7 +201,8 @@ def test_full_ship_runs_every_gate_in_order(cfg_path, clock):
     ("d) preview deploy", dict(vercel="deploy")),
     ("e) smoke test", dict(smoke_ok=False)),
     ("f) prod migrations", dict(supabase_fail="prod")),
-    ("g) promote to prod", dict(vercel="promote")),
+    ("g) prod deploy", dict(vercel="deploy --prod")),
+    ("h) prod smoke test", dict(prod_smoke_ok=False)),
 ])
 def test_later_steps_never_run_after_a_failure(cfg_path, clock, fail_at, setup):
     if "vercel" in setup:
@@ -198,10 +215,11 @@ def test_later_steps_never_run_after_a_failure(cfg_path, clock, fail_at, setup):
     assert ran == ORDER[:ORDER.index(fail_at) + 1]                  # nothing recorded after the failure
     assert steps(o)[-1] == (fail_at, "fail")
     later = ORDER[ORDER.index(fail_at) + 1:]
-    called = rt.calls.names()
+    called = [c if c[0] == "smoke" else c[0] for c in rt.calls]
     gate_calls = {"b) tests": "npm test", "c) staging migrations": "supabase staging", "d) preview deploy": "vercel deploy",
-                  "e) smoke test": "smoke", "f) prod migrations": "supabase prod", "g) promote to prod": "vercel promote",
-                  "h) prod health watch": "health"}
+                  "e) smoke test": ("smoke", PREVIEW), "f) prod migrations": "supabase prod",
+                  "g) prod deploy": "vercel deploy --prod", "h) prod smoke test": ("smoke", PROD),
+                  "i) prod health watch": "health"}
     for step in later:
         assert gate_calls[step] not in called, f"{step} ran after {fail_at} failed"
 
@@ -213,10 +231,12 @@ def test_dry_run_lints_but_applies_no_migrations_and_stops_after_smoke(cfg_path,
     assert o.status == "dry_run_ok" and o.preview_url == "https://hello-abc123.vercel.app"
     assert steps(o) == [("Claude Code", "pass"), ("a) build", "pass"), ("b) tests", "pass"),
                         ("c) staging migrations", "skip"), ("d) preview deploy", "pass"), ("e) smoke test", "pass"),
-                        ("f) prod migrations", "skip"), ("g) promote to prod", "skip"), ("h) prod health watch", "skip")]
+                        ("f) prod migrations", "skip"), ("g) prod deploy", "skip"), ("h) prod smoke test", "skip"),
+                        ("i) prod health watch", "skip")]
     assert "dry run: not applied; lint ok (1 new migration file(s)" in o.steps[3]["detail"]
     called = rt.calls.names()
-    assert not {"supabase staging", "supabase prod", "vercel promote", "vercel env production", "health"} & set(called)
+    assert not {"supabase staging", "supabase prod", "vercel deploy --prod", "vercel env production", "health"} & set(called)
+    assert ("smoke", PROD) not in rt.calls
     t = rt.tickets.get(tid)
     assert t.status == "todo" and t.preview_url == o.preview_url and t.built_commit
     # a real build later reuses the dry-run commit: no second Claude Code session
@@ -313,10 +333,10 @@ def test_three_consecutive_failed_health_checks_roll_back_and_write_incident(cfg
                                               (False, "HTTP 502")])
     tid = hello_ticket(rt)
     [o] = rt.build()
-    assert o.status == "failed" and steps(o)[-1] == ("h) prod health watch", "fail")
+    assert o.status == "failed" and steps(o)[-1] == ("i) prod health watch", "fail")
     assert "failed 3x in a row" in o.reason
     names = rt.calls.names()
-    assert names.index("vercel rollback") > names.index("vercel promote")
+    assert names.index("vercel rollback") > names.index("vercel deploy --prod")
     assert names.count("health") == 4                                 # stopped at the 3rd consecutive failure
     retros = list((rt.memory.root / "retros").glob("*incident*.md"))
     assert len(retros) == 1
@@ -533,3 +553,48 @@ def test_prompt_states_additive_migration_rule(cfg_path, clock):
     rt.build(dry_run=True)
     p = rt.fakes["claude"].prompts[0]
     assert "backward-compatible (additive only)" in p and "no RENAME" in p and "no DROP" in p
+
+
+# ------------------------------------------------------------------ prod deploy
+def test_failed_prod_smoke_rolls_back_before_health_watch(cfg_path, clock):
+    rt = make_rt(cfg_path, clock, prod_smoke_ok=False)
+    tid = hello_ticket(rt)
+    [o] = rt.build()
+    assert o.status == "failed" and steps(o)[-1] == ("h) prod smoke test", "fail")
+    assert "prod smoke test failed" in o.reason and "rollback succeeded" in o.reason
+    names = rt.calls.names()
+    assert names.index("vercel rollback") > names.index("vercel deploy --prod") and "health" not in names
+    [note] = list((rt.memory.root / "retros").glob("*incident*.md"))
+    meta, body = frontmatter.parse(note.read_text())
+    assert meta["rolled_back"] is True and "smoke test" in meta["title"] and PROD in body
+    t = rt.tickets.get(tid)
+    assert t.attempts == 1 and t.built_commit is None                 # code suspect: new session next time
+
+
+def test_prod_deploy_refuses_a_commit_other_than_the_previews(cfg_path, clock):
+    rt = make_rt(cfg_path, clock)
+    hello_ticket(rt)
+    repo_dir = rt.cfg.ventures_dir / "hello"
+    orig = rt.fakes["supabase"].push
+    def push(which):                                                  # something changes the repo after the preview
+        (repo_dir / "late.txt").write_text("x")
+        return orig(which)
+    rt.fakes["supabase"].push = push
+    rt.fakes["claude"].migrations = True
+    [o] = rt.build()
+    assert o.status == "failed" and steps(o)[-1] == ("g) prod deploy", "fail")
+    assert "refusing to deploy to prod" in o.reason and "vercel deploy --prod" not in rt.calls.names()
+
+
+def test_vercel_prod_deploy_uses_deploy_prod_not_promote(tmp_path):
+    from startup_os.ship.providers import Vercel
+    from startup_os.ship.secrets import VentureSecrets
+    seen = {}
+    def shell(cmd, *, cwd, env, timeout_s, stdout_path=None):
+        seen.update(cmd=cmd, env=env)
+        return CmdResult(0, "Production: https://hello-prod1.vercel.app [3s]\n", "", 0.1)
+    v = Vercel("vercel@64.7.0", VentureSecrets.from_env("hello", SECRETS), tmp_path, 60, shell=shell)
+    assert v.deploy_prod() == "https://hello-prod1.vercel.app"
+    assert seen["cmd"][-3:] == ["deploy", "--prod", "--yes"] and "promote" not in seen["cmd"]
+    assert seen["env"]["VERCEL_TOKEN"] == "vercel-secret-token-123"
+    assert not hasattr(v, "promote")

@@ -2,8 +2,9 @@
 
 Ship bar (run by Startup OS, in order, stopping at the first failure):
   a) build  b) tests  c) staging migrations (backward-compat lint first)  d) preview deploy
-  (wired to the staging Supabase project)  e) smoke test  f) prod migrations  g) promote
-  h) prod health (rollback after N consecutive failures)
+  (wired to the staging Supabase project)  e) smoke test  f) prod migrations
+  g) prod deploy: a fresh `vercel deploy --prod` from the same commit, wired to the prod Supabase project
+  h) prod smoke test (same checks as e), rollback on failure)  i) prod health (rollback after N consecutive failures)
 --dry-run runs the lint but applies no migrations, and stops after the smoke test: no prod."""
 from __future__ import annotations
 
@@ -34,10 +35,12 @@ from .ventures import VentureRepo
 AGENT = "build"
 STEPS = [("build", "a) build"), ("test", "b) tests"), ("migrate_staging", "c) staging migrations"),
          ("preview", "d) preview deploy"), ("smoke", "e) smoke test"), ("migrate_prod", "f) prod migrations"),
-         ("promote", "g) promote to prod"), ("prod_health", "h) prod health watch")]
+         ("deploy_prod", "g) prod deploy"), ("prod_smoke", "h) prod smoke test"),
+         ("prod_health", "i) prod health watch")]
 DRY_RUN_STEPS = {"build", "test", "preview", "smoke"}   # + the migration lint (not applied)
 # failures at these steps mean the code itself is suspect: the next attempt starts a new session
-CODE_STEPS = {"Claude Code", "a) build", "b) tests", "c) staging migrations", "e) smoke test", "h) prod health watch"}
+CODE_STEPS = {"Claude Code", "a) build", "b) tests", "c) staging migrations", "e) smoke test", "h) prod smoke test",
+              "i) prod health watch"}
 SHIPPED_TAG = "startup-os/shipped"
 
 
@@ -147,7 +150,7 @@ class Builder:
             o.steps.append(row)
             log.event("ship_step", **row)
 
-        state: dict = {"preview_url": None, "prod_url": None}
+        state: dict = {"preview_url": None, "prod_url": None, "commit": None, "prod_deployment_url": None}
         try:
             # 0. Claude Code
             if reuse:
@@ -285,7 +288,7 @@ class Builder:
             vercel.sync_env("preview", env)
             log.event("vercel_env", target="preview", supabase="staging", keys=sorted(env))
         url = vercel.deploy_preview()
-        state["preview_url"] = url
+        state["preview_url"], state["commit"] = url, repo.head()
         return "preview deployed" + (" (Supabase: staging)" if env else ""), url
 
     def _checks(self, t) -> list[Check]:
@@ -332,14 +335,39 @@ class Builder:
     def _step_migrate_prod(self, t, repo, secrets, state, log):
         return self._migrate(repo, secrets, "prod")
 
-    def _step_promote(self, t, repo, secrets, state, log):
+    def _step_deploy_prod(self, t, repo, secrets, state, log):
+        """A fresh production build from the exact commit the preview was built and smoke-tested from."""
+        sha = repo.head()
+        if sha != state["commit"] or repo.dirty():
+            raise StepFailed(f"venture repo moved since the preview (preview {str(state['commit'])[:10]}, "
+                             f"now {sha[:10]}{', dirty' if repo.dirty() else ''}); refusing to deploy to prod")
         vercel = self.d.vercel(secrets, repo.path)
         env = self._supabase_env(repo, secrets, "prod")
         if env:   # production deployments use the prod Supabase project
             vercel.sync_env("production", env)
             log.event("vercel_env", target="production", supabase="prod", keys=sorted(env))
-        state["prod_url"] = vercel.promote(state["preview_url"])
-        return f"promoted {state['preview_url']}", state["prod_url"]
+        state["prod_deployment_url"] = vercel.deploy_prod()
+        state["prod_url"] = secrets.get("PROD_URL")
+        log.event("prod_deploy", commit=sha, deployment_url=state["prod_deployment_url"], prod_url=state["prod_url"])
+        return (f"vercel deploy --prod of {sha[:10]} → {state['prod_deployment_url']}"
+                + (" (Supabase: prod)" if env else "")), state["prod_url"]
+
+    def _step_prod_smoke(self, t, repo, secrets, state, log):
+        url = state["prod_url"]
+        res = self.d.smoke(url, self._checks(t), None)
+        log.event("prod_smoke", url=url, results=res.results)
+        if not res.ok:
+            history = [{"at": self.d.now().isoformat(timespec="seconds"), "ok": False, "detail": res.summary()}]
+            rb = self._rollback(repo, secrets, log)
+            note = self._incident(t, repo, url, history, rb, what="smoke test")
+            raise StepFailed(f"prod smoke test failed: {res.summary()}; Vercel rollback "
+                             f"{'succeeded' if rb.ok else 'FAILED'}; incident note {note}")
+        return res.summary(), url
+
+    def _rollback(self, repo, secrets, log):
+        rb = self.d.vercel(secrets, repo.path).rollback()
+        log.event("rollback", ok=rb.ok, output=rb.tail(500))
+        return rb
 
     def _step_prod_health(self, t, repo, secrets, state, log):
         c = self.d.cfg.ship
@@ -352,8 +380,7 @@ class Builder:
             log.event("prod_health", n=i + 1, ok=ok, detail=detail)
             consecutive = 0 if ok else consecutive + 1
             if consecutive >= c.health_failures_before_rollback:
-                rb = self.d.vercel(secrets, repo.path).rollback()
-                log.event("rollback", ok=rb.ok, output=rb.tail(500))
+                rb = self._rollback(repo, secrets, log)
                 note = self._incident(t, repo, url, history, rb)
                 raise StepFailed(f"prod health failed {consecutive}x in a row ({detail}); Vercel rollback "
                                  f"{'succeeded' if rb.ok else 'FAILED'}; incident note {note}")
@@ -361,14 +388,15 @@ class Builder:
                 self.d.sleep(c.health_interval_s)
         return f"{checks} health checks over {c.health_minutes:g} min all passed", url
 
-    def _incident(self, t, repo, url, history, rb) -> str:
+    def _incident(self, t, repo, url, history, rb, what: str = "health check") -> str:
         now = self.d.now()
         rel = self.d.memory.unique_path(f"retros/{now.date().isoformat()}-incident-{t.id.lower()}.md")
-        meta = {"title": f"Incident: {t.venture} prod health failed after {t.id}", "type": "incident",
+        meta = {"title": f"Incident: {t.venture} prod {what} failed after {t.id}", "type": "incident",
                 "date": now.isoformat(timespec="seconds"), "ticket": t.id, "venture": t.venture,
                 "prod_url": url, "commit": repo.head(), "rolled_back": rb.ok}
-        body = [f"# Incident: {t.venture} — prod health check failed", "",
-                f"After promoting {t.id} ({t.title}), `GET {url}/api/health` failed. "
+        failed = "`GET " + url + "/api/health` failed" if what == "health check" else f"the smoke test of {url} failed"
+        body = [f"# Incident: {t.venture} — prod {what} failed", "",
+                f"After deploying {t.id} ({t.title}) to production, {failed}. "
                 f"Startup OS {'rolled back' if rb.ok else 'tried to roll back'} the Vercel production deployment.", "",
                 "## Timeline (UTC)", "", "| Time | Health | Detail |", "|---|---|---|"]
         body += [f"| {h['at']} | {'ok' if h['ok'] else 'FAIL'} | {h['detail']} |" for h in history]
@@ -376,10 +404,10 @@ class Builder:
                  "```", rb.tail(800) or "(no output)", "```", "",
                  "## Follow-up", "", f"- {t.id} counts as a failed attempt; after {self.d.cfg.ship.max_attempts} "
                  "failures it goes back to the CEO (needs_rescope).",
-                 "- Prod database migrations, if any, were applied before promotion and are NOT rolled back; "
+                 "- Prod database migrations, if any, were applied before the prod deploy and are NOT rolled back; "
                  "they are additive-only (linted), so the previous deployment keeps working."]
         self.d.memory.write(rel, frontmatter.dump(meta, "\n".join(body) + "\n"), agent=AGENT,
-                            message=f"incident: {t.venture} prod health failed after {t.id}; rollback "
+                            message=f"incident: {t.venture} prod {what} failed after {t.id}; rollback "
                                     f"{'ok' if rb.ok else 'FAILED'}")
         return rel
 

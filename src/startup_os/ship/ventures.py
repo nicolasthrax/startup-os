@@ -10,7 +10,7 @@ GITIGNORE = "node_modules/\n.next/\n.vercel/\n.env\n.env.*\ncoverage/\nplaywrigh
 README = """# {name}
 
 Venture code repo managed by Startup OS. Tickets are implemented by headless Claude Code
-(`startup-os build`); the ship bar (build, tests, preview, smoke, migrations, promote, health)
+(`startup-os build`); the ship bar (build, tests, preview, smoke, migrations, prod deploy, prod smoke, health)
 is run by Startup OS, not by Claude Code.
 
 `ship.json` (written by Claude Code when needed) declares anything that needs money:

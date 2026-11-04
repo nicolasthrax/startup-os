@@ -62,12 +62,16 @@ class Vercel:
             raise StepFailed(f"vercel deploy printed no URL: {res.tail()}")
         return urls[-1].rstrip(".,)")
 
-    def promote(self, url: str) -> str:
-        res = self._run("promote", url, "--yes")
+    def deploy_prod(self) -> str:
+        """Fresh production build and deploy of the working tree (`vercel deploy --prod`); returns its URL."""
+        res = self._run("deploy", "--prod", "--yes")
         check_paid(res, "Vercel Pro plan", 20)
         if not res.ok:
-            raise StepFailed(f"vercel promote failed: {res.tail()}")
-        return self.secrets.get("PROD_URL")
+            raise StepFailed(f"vercel deploy --prod failed: {res.tail()}")
+        urls = URL_RE.findall(res.stdout) or URL_RE.findall(res.stderr)
+        if not urls:
+            raise StepFailed(f"vercel deploy --prod printed no URL: {res.tail()}")
+        return urls[-1].rstrip(".,)")
 
     def rollback(self) -> CmdResult:
         return self._run("rollback", "--yes")

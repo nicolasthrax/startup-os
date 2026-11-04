@@ -113,8 +113,12 @@ Then **our code** runs the ship bar, in order, stopping at the first failure:
 | d) preview deploy | point the Vercel *preview* env at staging Supabase, then `vercel deploy` (pinned CLI) → preview URL |
 | e) smoke test | `GET /api/health` → `{"status":"ok"}`, plus 1–3 Playwright checks derived from acceptance criteria like `The home page / shows "Hello"` |
 | f) prod migrations | apply the same migrations to the **prod** Supabase project (only after the smoke test passed) |
-| g) promote | point the Vercel *production* env at prod Supabase, then `vercel promote <preview>` |
-| h) prod health | `/api/health` every 30 s for 10 min; after 3 consecutive failures (`health_failures_before_rollback`) `vercel rollback` and an incident note in `company/retros/` |
+| g) prod deploy | point the Vercel *production* env at prod Supabase, then a fresh `vercel deploy --prod` from the same commit as the preview (refused if the venture repo moved) |
+| h) prod smoke test | the same health check and Playwright checks as e), against `PROD_URL`; on failure `vercel rollback` and an incident note |
+| i) prod health | `/api/health` every 30 s for 10 min; after 3 consecutive failures (`health_failures_before_rollback`) `vercel rollback` and an incident note in `company/retros/` |
+
+Production gets its own build rather than promoting the preview: `NEXT_PUBLIC_*` values are baked in
+at build time, so a promoted preview would still talk to the staging Supabase project.
 
 No Supabase branching (it needs a paid plan): staging and prod are two separate free projects.
 

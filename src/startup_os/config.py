@@ -111,7 +111,7 @@ class ShipConfig(BaseModel):
     step_timeout_min: float = 15
     vercel_cli: str = "vercel@64.7.0"     # pinned, >= 2 weeks old
     supabase_cli: str = "supabase@2.121.0"
-    health_minutes: float = 10           # prod health watch after promotion
+    health_minutes: float = 10           # prod health watch after the prod deploy
     health_interval_s: float = 30
     health_failures_before_rollback: int = 3   # consecutive failed checks before rollback
     max_smoke_checks: int = 3
