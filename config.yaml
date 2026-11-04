@@ -5,6 +5,13 @@ paths:
   data: data              # SQLite: usage/queue, search index, LangGraph checkpoints
   logs: logs              # structured JSONL run logs
 
+company:
+  # Private Git remote for company/, so it survives fresh sessions. Pulled at the start of every
+  # command, pushed after every commit, never force-pushed. Token comes from the env var below
+  # (never put it in the URL, config or .env committed anywhere). Unset → local-only, with a warning.
+  remote: https://github.com/nicolasthrax/startup-os-company.git
+  token_env: COMPANY_REPO_TOKEN
+
 llm:
   base_url: https://openrouter.ai/api/v1
   api_key_env: OPENROUTER_API_KEY

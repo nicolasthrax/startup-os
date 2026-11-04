@@ -10,6 +10,7 @@ from datetime import datetime
 
 from .approvals import ApprovalError
 from .runtime import CommandError, MissingAPIKey, Runtime, TaskOutcome
+from .sync import SyncError
 from .tickets import TicketError
 from .venture import TransitionError
 
@@ -101,6 +102,17 @@ def cmd_ticket_add(args, rt: Runtime) -> int:
     tid = rt.add_ticket(title=args.title, owner=args.owner, venture=args.venture, criteria=args.criterion,
                         description=args.description or "", depends_on=args.depends_on or [])
     print(f"created {tid}")
+    return 0
+
+
+def cmd_sync(args, rt: Runtime) -> int:
+    if not (rt.cfg.company.remote and rt.sync.token):
+        rt.sync.enabled   # warns
+        return 1
+    print(f"company/ ⇄ {rt.cfg.company.remote}")
+    print(f"  pull: {rt.pulled}")                 # the pull already ran at startup
+    print(f"  push: {rt.sync.push()}")
+    print(f"  head: {rt.memory.head()[:10]}  {rt.memory.log(1)[0]}")
     return 0
 
 
@@ -294,6 +306,7 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--ticket", default=None)
     s.add_argument("--dry-run", action="store_true", help="stop after the preview deploy + smoke test")
     s.set_defaults(fn=cmd_build)
+    sub.add_parser("sync", help="pull and push company/ to the private remote (company.remote)").set_defaults(fn=cmd_sync)
     s = sub.add_parser("ticket-add", help="create a ticket by hand")
     s.add_argument("--title", required=True)
     s.add_argument("--owner", required=True, choices=["research", "claude-code"])
@@ -315,7 +328,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"note: requeued {len(rt.recovered)} interrupted task(s) "
                   f"({', '.join(rt.recovered)}); run `startup-os run-due` to resume them.")
         return args.fn(args, rt)
-    except (MissingAPIKey, CommandError, ApprovalError, TransitionError, TicketError) as e:
+    except (MissingAPIKey, CommandError, ApprovalError, TransitionError, TicketError, SyncError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
 

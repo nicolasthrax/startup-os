@@ -40,6 +40,7 @@ uv run startup-os approve A-3     # or: reject A-3 --reason "..."
 uv run startup-os tickets [--all] # tickets and why they are blocked
 uv run startup-os venture         # stage and stage history
 uv run startup-os build [--ticket T-0005] [--dry-run]   # Claude Code + ship bar (see below)
+uv run startup-os sync            # pull + push company/ to the private remote (company.remote)
 uv run startup-os ticket-add --owner claude-code --venture hello --title "..." --criterion "..."
 uv run pytest                     # tests (LLM calls are mocked)
 ```
@@ -47,6 +48,23 @@ uv run pytest                     # tests (LLM calls are mocked)
 Each brief has: problem, ICP, why now, competitors, kill criteria, and a 1–10 demand-signal
 score with reasoning. Front matter records the models used, run id and `evidence: web` or
 `evidence: reasoning-only`; reasoning-only briefs also carry a visible warning.
+
+## Persisting company/ (`startup-os sync`)
+
+`company/` is git-ignored here but is its own Git repo, synced to a private remote so it survives fresh
+sessions: set `company.remote` in `config.yaml` (an `https://github.com/...git` URL with no credentials;
+URLs with credentials are rejected) and export `COMPANY_REPO_TOKEN` (a fine-grained token with Contents
+read/write on that one repo).
+
+- Every command pulls first; every company/ commit is pushed straight after. `sync` does both on demand.
+- The token reaches git only through in-memory `GIT_CONFIG_*` env vars (an `http.extraHeader`), never on
+  the command line, in `.git/config`, in logs or in error messages (they are scrubbed). It is stripped
+  from Claude Code's environment like the other project secrets.
+- A fresh, empty `company/` adopts the remote's history. A rejected push merges the remote and retries
+  once. A conflicting merge is aborted, the files are reported and the command stops: nothing is
+  overwritten and nothing is ever force-pushed.
+- No remote or no token: one warning, then local-only.
+- `data/` (SQLite: approvals, budget usage, sessions) and `logs/` are not synced.
 
 ## The venture loop
 

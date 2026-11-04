@@ -28,9 +28,10 @@ class MemoryError(Exception):
 
 
 class MemoryRepo:
-    def __init__(self, root: Path, index: SearchIndex | None = None):
+    def __init__(self, root: Path, index: SearchIndex | None = None, on_commit=None):
         self.root = Path(root).resolve()
         self.index = index
+        self.on_commit = on_commit     # called after every new commit (e.g. push to the company remote)
 
     # -- git -------------------------------------------------------------
     def _git(self, *args: str) -> str:
@@ -95,6 +96,8 @@ class MemoryRepo:
         sha = self.head()
         if self.index:
             self.index.rebuild()
+        if self.on_commit:
+            self.on_commit(sha)
         return sha
 
     def write(self, rel_path: str | Path, content: str, *, agent: str, message: str) -> str:

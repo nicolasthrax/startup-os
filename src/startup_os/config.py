@@ -15,6 +15,17 @@ class PathsConfig(BaseModel):
     logs: Path = Path("logs")
 
 
+class CompanyConfig(BaseModel):
+    remote: str | None = None              # private Git remote for company/ (no token in the URL)
+    token_env: str = "COMPANY_REPO_TOKEN"  # env var holding the token; never written to disk
+
+    @model_validator(mode="after")
+    def _no_credentials_in_url(self) -> "CompanyConfig":
+        if self.remote and "@" in self.remote.split("://", 1)[-1].split("/", 1)[0]:
+            raise ValueError("company.remote must not contain credentials; use the COMPANY_REPO_TOKEN env var")
+        return self
+
+
 class LLMConfig(BaseModel):
     base_url: str = "https://openrouter.ai/api/v1"
     api_key_env: str = "OPENROUTER_API_KEY"
@@ -124,6 +135,7 @@ class CEOConfig(BaseModel):
 class Config(BaseModel):
     root: Path = Path(".")
     paths: PathsConfig = PathsConfig()
+    company: CompanyConfig = CompanyConfig()
     llm: LLMConfig
     budget: BudgetConfig = BudgetConfig()
     guards: GuardsConfig = GuardsConfig()

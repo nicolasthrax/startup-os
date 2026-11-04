@@ -4,6 +4,8 @@ queue, checkpointed by LangGraph, and deferred (not dropped) when the budget or
 all models are exhausted."""
 from __future__ import annotations
 
+import sys
+
 import re
 import sqlite3
 from dataclasses import dataclass, field
@@ -23,6 +25,7 @@ from .config import BUDGET_AGENTS, Config, split_problem
 from .guards import LoopGuard
 from .llm import AllModelsFailed, CallFn, ModelRouter, openrouter_call_fn
 from .memory import MemoryRepo
+from .sync import CompanySync, SyncConflict, SyncError
 from .runlog import NullRunLog, RunLog
 from .search_index import SearchIndex
 from .paths import check_path
@@ -57,14 +60,20 @@ TASK_AGENT = {"ideas": "research", "validate": "research", "ticket": "research",
 
 class Runtime:
     def __init__(self, cfg: Config, *, call_fn: CallFn | None = None, web_search_fn=None,
-                 scheduler: Scheduler | None = None, now=None, ship_overrides: dict | None = None):
+                 scheduler: Scheduler | None = None, now=None, ship_overrides: dict | None = None,
+                 sync: CompanySync | None = None):
         self.cfg = cfg
         self.ship_overrides = ship_overrides or {}
         self.now = now or (lambda: datetime.now(timezone.utc))
         cfg.data_dir.mkdir(parents=True, exist_ok=True)
         self.index = SearchIndex(cfg.data_dir / "index.db", cfg.company_dir)
-        self.memory = MemoryRepo(cfg.company_dir, self.index)
+        self.sync = sync or CompanySync.from_config(cfg.company_dir, cfg.company.remote, cfg.company.token_env)
+        self.memory = MemoryRepo(cfg.company_dir, self.index, on_commit=self._push)
         self.memory.ensure()
+        self.pulled = self.sync.pull()          # every command starts from the remote's latest state
+        if self.pulled not in ("local-only", "up to date", "remote is empty"):
+            self.memory.ensure()                # adopted/merged history may lack the layout
+            self.index.rebuild()
         self.scheduler = scheduler or Scheduler.from_config(cfg, now=self.now)
         self.approvals = ApprovalQueue(cfg.data_dir / "state.db", now=self.now, on_decided=self._on_decided)
         self.venture = Venture(self.memory, now=self.now)
@@ -80,6 +89,16 @@ class Runtime:
         self.auto_approved = self.approvals.process_due()
 
     # ------------------------------------------------------------ plumbing --
+    def _push(self, sha: str) -> None:
+        """After every company/ commit. A conflict stops the command; a network failure only warns
+        (the commit is safe locally and goes out with the next push or `startup-os sync`)."""
+        try:
+            self.sync.push()
+        except SyncConflict:
+            raise
+        except SyncError as e:
+            print(f"warning: company/ commit {sha[:10]} not pushed yet: {e}", file=sys.stderr)
+
     def call_fn(self) -> CallFn:
         if self._call_fn is None:
             key = self.cfg.api_key()

@@ -11,7 +11,7 @@ import re
 from dataclasses import dataclass
 
 # Secret env vars that must never reach Claude Code (its own auth vars are kept).
-SECRET_PREFIXES = ("VENTURE_", "VERCEL_", "SUPABASE_", "OPENROUTER_")
+SECRET_PREFIXES = ("VENTURE_", "VERCEL_", "SUPABASE_", "OPENROUTER_", "COMPANY_REPO_")
 SECRET_NAMES = {"GH_TOKEN", "GITHUB_TOKEN", "CLOUDSDK_AUTH_ACCESS_TOKEN", "DATABASE_URL", "NPM_TOKEN"}
 NAMES = ("VERCEL_TOKEN", "VERCEL_ORG_ID", "VERCEL_PROJECT_ID", "VERCEL_BYPASS_SECRET", "PROD_URL",
          "SUPABASE_STAGING_DB_URL", "SUPABASE_PROD_DB_URL",
