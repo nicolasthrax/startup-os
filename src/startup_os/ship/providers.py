@@ -21,7 +21,8 @@ PAID_PATTERNS = re.compile(
 # as blocked_config without a strike (like a missing credential).
 VERCEL_CONFIG_PATTERNS = re.compile(
     r"project not found|\b40[13]\b|forbidden|not authori[sz]ed|unauthori[sz]ed|"
-    r"(?:invalid|expired|missing) (?:token|credentials)|token (?:is )?(?:not valid|invalid|expired)|"
+    r"(?:invalid|expired|missing|revoked) (?:token|credentials)|token\b[^\n]{0,80}\b(?:not valid|invalid|expired|revoked)|"
+    r"provide a valid token|vercel login|"
     r"you (?:do not|don't) have (?:permission|access)|no access to|team not found|scope not found|"
     r"could not retrieve project settings|specified VERCEL_(?:ORG|PROJECT)_ID|forgot to specify VERCEL_",
     re.IGNORECASE)

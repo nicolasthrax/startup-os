@@ -632,6 +632,8 @@ def test_vercel_config_errors_block_without_a_strike(cfg_path, clock, on, step):
 @pytest.mark.parametrize("out,config", [
     ('Error: Project not found ({"VERCEL_PROJECT_ID":"prj_x","VERCEL_ORG_ID":"y"})', True),
     ("Error: The specified token is not valid. Use `vercel login` to generate a new token.", True),
+    ("Error: The token provided via VERCEL_TOKEN environment variable is not valid. Please provide a valid token.", True),
+    ("Error: Your token has expired", True),
     ("Error: Request failed with status 403 Forbidden", True),
     ("Error: 401 Unauthorized", True),
     ("Error: You do not have access to the specified account", True),
